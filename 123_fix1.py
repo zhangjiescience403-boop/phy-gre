@@ -71,48 +71,48 @@ def _simpson_weights(m: int) -> np.ndarray:
 
 def preprocess_window_eq(X_np: np.ndarray, m=20, delta_ratio=0.2):
     """基于内侧裂尖对称窗口的 E_eq 复合 Simpson 平均。X: [Ro, R_n, crack_n, theta_deg, n_FGM]"""
-    N = X_np.shape[0]
-    Ro, Rn, crack_n, theta_deg, n_FGM = [X_np[:, i].astype(np.float64) for i in range(5)]
+    N = X_np.shape[0]                                      # 样本条数
+    Ro, Rn, crack_n, theta_deg, n_FGM = [X_np[:, i].astype(np.float64) for i in range(5)]  # 原始几何/材料参数
 
-    Ri = Rn * Ro
-    Rp = Ri
-    Dp = Ro - Ri
-    a  = crack_n * Dp
+    Ri = Rn * Ro                                          # 内半径 = 比例 * 外半径
+    Rp = Ri                                               # 裂纹起始位置（内表面）
+    Dp = Ro - Ri                                          # 壁厚
+    a  = crack_n * Dp                                     # 裂纹深度
 
-    if np.any(Dp <= 0):
+    if np.any(Dp <= 0):                                   # 壁厚应为正，否则几何非法
         bad = np.where(Dp <= 0)[0]
         raise ValueError(f"存在 Dp<=0（壁厚非正），样本行: {bad[:10]} ...")
-    if np.any((a <= 0) | (a >= Dp)):
+    if np.any((a <= 0) | (a >= Dp)):                       # 裂纹深度需落在壁厚范围内
         bad = np.where((a <= 0) | (a >= Dp))[0]
         raise ValueError(f"裂纹深度 a 不在 (0, Dp) 内，样本行: {bad[:10]} ...")
 
-    r_tip = Rp + a
-    Delta = np.maximum(1e-12, delta_ratio * a)
+    r_tip = Rp + a                                        # 裂尖位置
+    Delta = np.maximum(1e-12, delta_ratio * a)            # 目标半窗宽（比例缩放裂纹深度，含下限）
 
-    left_half  = np.minimum(Delta, r_tip - Rp)
-    right_half = np.minimum(Delta, Rp + Dp - r_tip)
-    half = np.minimum(left_half, right_half)
-    left, right = r_tip - half, r_tip + half
-    Delta_eff = right - left
+    left_half  = np.minimum(Delta, r_tip - Rp)            # 左半窗不能超出内壁
+    right_half = np.minimum(Delta, Rp + Dp - r_tip)       # 右半窗不能超出外壁
+    half = np.minimum(left_half, right_half)              # 取左右可行范围的最小值保证对称
+    left, right = r_tip - half, r_tip + half              # 对称窗口边界
+    Delta_eff = right - left                              # 实际窗口宽度
 
-    if np.any(Delta_eff <= 0):
+    if np.any(Delta_eff <= 0):                            # 数值安全检查：窗口必须有正宽度
         bad = np.where(Delta_eff <= 0)[0]
         raise ValueError(f"窗口宽度为零，检查 delta_ratio/几何，样本行: {bad[:10]} ...")
 
-    h = Delta_eff / m
-    w = _simpson_weights(m)
+    h = Delta_eff / m                                     # Simpson 等分步长
+    w = _simpson_weights(m)                               # Simpson 权重（1,4,2,...,4,1）
 
-    Eeq = np.zeros(N, dtype=np.float64)
-    E0 = 214e9
-    dE = 166e9
+    Eeq = np.zeros(N, dtype=np.float64)                   # 逐样本存放 E_eq
+    E0 = 214e9                                            # 基体弹性模量
+    dE = 166e9                                            # 梯度增强幅值
 
-    for i in range(N):
-        r_i = left[i] + h[i] * np.arange(m + 1, dtype=np.float64)
-        r_i = np.clip(r_i, Rp[i], Rp[i] + Dp[i])
-        xi  = 1.0 - (r_i - Rp[i]) / Dp[i]
-        Ei  = E0 + dE * np.power(xi, n_FGM[i])
-        integral = (h[i] / 3.0) * np.dot(w, Ei)
-        Eeq[i]   = integral / Delta_eff[i]
+    for i in range(N):                                    # 对每个样本执行 Simpson 复合积分
+        r_i = left[i] + h[i] * np.arange(m + 1, dtype=np.float64)   # 网格节点位置
+        r_i = np.clip(r_i, Rp[i], Rp[i] + Dp[i])                     # 限制在筒壁内，防浮点越界
+        xi  = 1.0 - (r_i - Rp[i]) / Dp[i]                            # 归一化径向坐标（内壁为 1）
+        Ei  = E0 + dE * np.power(xi, n_FGM[i])                      # 径向梯度弹性模量
+        integral = (h[i] / 3.0) * np.dot(w, Ei)                     # Simpson 积分求等效模量面积
+        Eeq[i]   = integral / Delta_eff[i]                          # 平均化得到 E_eq
 
     aux = dict(Ro=Ro, Ri=Ri, Rp=Rp, Dp=Dp, a=a,
                r_tip=r_tip, left=left, right=right, h=h, m=m, delta_ratio=delta_ratio)
@@ -123,72 +123,63 @@ def preprocess_window_eq(X_np: np.ndarray, m=20, delta_ratio=0.2):
 # ------------------------------------------------------------
 
 def validate_and_prepare(X_raw: np.ndarray, Y_raw: np.ndarray):
-    if not isinstance(X_raw, np.ndarray) or not isinstance(Y_raw, np.ndarray):
+    if not isinstance(X_raw, np.ndarray) or not isinstance(Y_raw, np.ndarray):  # 输入类型必须是 ndarray
         raise TypeError("X_raw/Y_raw 必须是 numpy.ndarray")
 
-    # X 基础形状
-    if X_raw.ndim != 2 or X_raw.shape[1] != 5:
+    if X_raw.ndim != 2 or X_raw.shape[1] != 5:                                    # X 的形状校验（几何+材料共 5 列）
         raise ValueError(f"X 形状应为 (N,5)，当前 {X_raw.shape}")
 
-    # Y 统一二维
-    if Y_raw.ndim == 1:
+    if Y_raw.ndim == 1:                                                            # 将 Y 补齐为二维列向量
         Y_raw = Y_raw.reshape(-1, 1)
-    elif Y_raw.ndim == 2 and Y_raw.shape[0] == 1 and Y_raw.shape[1] > 1:
+    elif Y_raw.ndim == 2 and Y_raw.shape[0] == 1 and Y_raw.shape[1] > 1:           # 支持 MATLAB 行向量格式
         Y_raw = Y_raw.T
-    if Y_raw.ndim != 2:
+    if Y_raw.ndim != 2:                                                            # 统一二阶张量，便于后续标准化
         raise ValueError(f"Y 形状应为二维 (N,C)，当前 {Y_raw.shape}")
 
-    # 有限性过滤
-    X_finite = np.all(np.isfinite(X_raw), axis=1)
-    Y_finite = np.all(np.isfinite(Y_raw), axis=1)
-    keep_mask = X_finite & Y_finite
+    X_finite = np.all(np.isfinite(X_raw), axis=1)                                  # X 有限性掩码
+    Y_finite = np.all(np.isfinite(Y_raw), axis=1)                                  # Y 有限性掩码
+    keep_mask = X_finite & Y_finite                                                # 仅保留完全有限的样本
     if not keep_mask.all():
         bad = np.where(~keep_mask)[0]
         print(f"警告：移除含 NaN/Inf 样本 {bad.shape[0]} 行，示例索引: {bad[:10]}")
-    Xc = X_raw[keep_mask].astype(np.float64)
+    Xc = X_raw[keep_mask].astype(np.float64)                                       # 转 double 提高校验精度
     Yc = Y_raw[keep_mask].astype(np.float64)
 
-    # 物理约束
-    Ro  = Xc[:,0]; Rn = Xc[:,1]; crack_n = Xc[:,2]
-    if np.any(Ro <= 0):
+    Ro  = Xc[:,0]; Rn = Xc[:,1]; crack_n = Xc[:,2]                                # 物理几何抽取（外半径、比例、裂纹深度比）
+    if np.any(Ro <= 0):                                                            # 外半径应正，避免非物理尺寸
         bad = np.where(Ro <= 0)[0]; raise ValueError(f"存在 Ro<=0，样本行: {bad[:10]} ...")
-    if np.any((Rn <= 0) | (Rn >= 1)):
+    if np.any((Rn <= 0) | (Rn >= 1)):                                              # R_n 必须落在 (0,1)，确保内径小于外径
         bad = np.where((Rn <= 0) | (Rn >= 1))[0]; raise ValueError(f"R_n 必须在 (0,1)，样本行: {bad[:10]} ...")
-    if np.any((crack_n <= 0) | (crack_n >= 1)):
+    if np.any((crack_n <= 0) | (crack_n >= 1)):                                    # 裂纹比例同样需在 (0,1)
         bad = np.where((crack_n <= 0) | (crack_n >= 1))[0]; raise ValueError(f"crack_n 必须在 (0,1)，样本行: {bad[:10]} ...")
 
-    # 几何一致性
-    Ri = Rn * Ro
-    Dp = Ro - Ri
-    a  = crack_n * Dp
-    if np.any(Dp <= 0):
+    Ri = Rn * Ro                                                                  # 内半径
+    Dp = Ro - Ri                                                                  # 壁厚
+    a  = crack_n * Dp                                                             # 裂纹深度绝对值
+    if np.any(Dp <= 0):                                                            # 几何一致性：壁厚必须正
         bad = np.where(Dp <= 0)[0]; raise ValueError(f"存在 Dp<=0（壁厚非正），样本行: {bad[:10]} ...")
-    if np.any((a <= 0) | (a >= Dp)):
+    if np.any((a <= 0) | (a >= Dp)):                                               # 裂纹深度不能为 0 或穿透
         bad = np.where((a <= 0) | (a >= Dp))[0]; raise ValueError(f"a 不在 (0,Dp)，样本行: {bad[:10]} ...")
 
-    # pre-warp crack_n
-    X_warp = Xc.copy()
-    X_warp[:, WARP_DIM] = np.sqrt(np.maximum(0.0, X_warp[:, WARP_DIM]) + WARP_EPS)
+    X_warp = Xc.copy()                                                             # 复制后做 warp，防修改原始备份
+    X_warp[:, WARP_DIM] = np.sqrt(np.maximum(0.0, X_warp[:, WARP_DIM]) + WARP_EPS) # 对 crack_n 先开方平滑，Eps 防负零
 
-    # z-score（针对 warp 后数据）
-    X_mean = X_warp.mean(axis=0)
-    X_std  = X_warp.std(axis=0)
-    X_std[X_std == 0] = 1.0
-    X_norm = (X_warp - X_mean) / X_std
+    X_mean = X_warp.mean(axis=0)                                                   # warp 后再计算均值
+    X_std  = X_warp.std(axis=0)                                                    # warp 后再计算标准差
+    X_std[X_std == 0] = 1.0                                                        # 防止零方差导致除零
+    X_norm = (X_warp - X_mean) / X_std                                             # z-score，提升核尺度稳定性
 
-    # Y 标准化
-    Y_mean = Yc.mean(axis=0)
-    Y_std  = Yc.std(axis=0)
-    Y_std[Y_std == 0] = 1.0
-    Y_norm = (Yc - Y_mean) / Y_std
+    Y_mean = Yc.mean(axis=0)                                                       # 输出均值
+    Y_std  = Yc.std(axis=0)                                                        # 输出标准差
+    Y_std[Y_std == 0] = 1.0                                                        # 同样避免除零
+    Y_norm = (Yc - Y_mean) / Y_std                                                 # 输出标准化，稳定 VGP 训练
 
-    # 最终检查
-    if X_norm.shape[0] != Y_norm.shape[0]:
+    if X_norm.shape[0] != Y_norm.shape[0]:                                         # 样本数一致性终检
         raise ValueError(f"X/Y 样本数不一致：{X_norm.shape[0]} vs {Y_norm.shape[0]}")
-    if not np.isfinite(X_norm).all():
+    if not np.isfinite(X_norm).all():                                              # 标准化后仍需保证有限
         bad = np.argwhere(~np.isfinite(X_norm))[:5]
         raise ValueError(f"X_norm 含非有限值，位置示例: {bad}")
-    if not np.isfinite(Y_norm).all():
+    if not np.isfinite(Y_norm).all():                                              # 输出同理
         bad = np.argwhere(~np.isfinite(Y_norm))[:5]
         raise ValueError(f"Y_norm 含非有限值，位置示例: {bad}")
 
@@ -327,47 +318,41 @@ if not np.isfinite(ll0).all():
 # ------------------------------------------------------------
 @tf.function
 def train_step_phys(x_batch, y_batch, eeq_phys_batch, step_counter):
-    # 线性 warmup：从 0 → PHYS_TARGET_LAM
-    lam = tf.cast(PHYS_TARGET_LAM, DTYPE) * tf.minimum(1.0, tf.cast(step_counter, DTYPE)/tf.cast(PHYS_WARMUP_STEPS, DTYPE))
+    lam = tf.cast(PHYS_TARGET_LAM, DTYPE) * tf.minimum(1.0, tf.cast(step_counter, DTYPE)/tf.cast(PHYS_WARMUP_STEPS, DTYPE))  # 线性 warmup，逐步放大物理权重
 
     with tf.GradientTape() as tape:
-        rv = model(x_batch, training=True)
-        nll = -tf.reduce_mean(rv.log_prob(y_batch))
-        kl  = tf.add_n(model.losses) if model.losses else tf.cast(0.0, DTYPE)
+        rv = model(x_batch, training=True)                                        # 前向获取预测分布
+        nll = -tf.reduce_mean(rv.log_prob(y_batch))                               # 数据项：负对数似然
+        kl  = tf.add_n(model.losses) if model.losses else tf.cast(0.0, DTYPE)     # 先验项：KL（来自 VGP 内部）
 
-        # 反标准化到物理量
-        K_pred = rv.mean()*Y_std_tf + Y_mean_tf
-        K_true = y_batch*Y_std_tf + Y_mean_tf
+        K_pred = rv.mean()*Y_std_tf + Y_mean_tf                                   # 反标准化预测，回到物理量 K
+        K_true = y_batch*Y_std_tf + Y_mean_tf                                     # 反标准化真值，保持同一尺度
 
-        # E'：平面应变（或应力）
-        Eprime = eeq_phys_batch/(1.0-NU**2)  # 若是平面应力，替换为 eeq_phys_batch
+        Eprime = eeq_phys_batch/(1.0-NU**2)                                      # 平面应变等效 E'（若用平面应力需改）
 
-        # 物理 J（带地板）
-        eps = tf.cast(J_ABS_FLOOR, DTYPE)
-        J_hat = tf.reduce_sum(tf.square(K_pred), axis=-1) / (Eprime + eps)
-        J_ref = tf.reduce_sum(tf.square(K_true), axis=-1) / (Eprime + eps)
+        eps = tf.cast(J_ABS_FLOOR, DTYPE)                                        # 绝对地板避免除零
+        J_hat = tf.reduce_sum(tf.square(K_pred), axis=-1) / (Eprime + eps)        # 预测 J 能量释放率
+        J_ref = tf.reduce_sum(tf.square(K_true), axis=-1) / (Eprime + eps)        # 参考 J（标签）
 
-        # 分位数自适应地板（按 batch）
-        # 说明：小数据/极小 J 会导致 log/比值不稳定，这里对两者同时加地板，保障数值稳定且不破坏相对尺度。
-        j_floor = tfp.stats.percentile(J_ref, q=tf.cast(J_FLOOR_PERCENT, tf.float32))
-        j_floor = tf.maximum(j_floor, eps)
-        J_hat_c = tf.maximum(J_hat, j_floor)
+        j_floor = tfp.stats.percentile(J_ref, q=tf.cast(J_FLOOR_PERCENT, tf.float32))  # 分位数地板：按 batch 抑制极小值
+        j_floor = tf.maximum(j_floor, eps)                                        # 保护地板不低于绝对下限
+        J_hat_c = tf.maximum(J_hat, j_floor)                                      # 同时对预测/真值加地板，保持相对比值
         J_ref_c = tf.maximum(J_ref, j_floor)
 
-        print(j_floor)
+        print(j_floor)                                                            # 训练期输出当前地板，便于监控
 
-        if PHYS_FORM == 'logratio':
+        if PHYS_FORM == 'logratio':                                               # log-ratio 更平滑，降低尺度敏感
             r = tf.math.log(J_hat_c) - tf.math.log(J_ref_c)
-        else:  # 'ratio'
+        else:                                                                     # ratio 直接比值，可更敏感但更直观
             r = J_hat_c / J_ref_c - 1.0
-        phys = tf.reduce_mean(tf.square(r)) * lam
+        phys = tf.reduce_mean(tf.square(r)) * lam                                 # 物理正则：平方误差后乘 warmup 权重
 
-        loss = nll + kl + phys
+        loss = nll + kl + phys                                                    # 总损失 = 数据 + KL + 物理项
 
-    grads = tape.gradient(loss, model.trainable_variables)
-    model.optimizer.apply_gradients(zip(grads, model.trainable_variables))
+    grads = tape.gradient(loss, model.trainable_variables)                        # 反向传播梯度
+    model.optimizer.apply_gradients(zip(grads, model.trainable_variables))        # 更新参数
     return {"loss": loss, "nll": nll, "kl": kl, "phys": phys, "lam": lam,
-            "r_mean": tf.reduce_mean(r), "J_floor": j_floor}
+            "r_mean": tf.reduce_mean(r), "J_floor": j_floor}                    # 返回监控指标（含地板/均值）
 
 # ------------------------------------------------------------
 # 训练循环（逐 batch 打印，定位 NaN）
