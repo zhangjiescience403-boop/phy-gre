@@ -54,6 +54,9 @@ PHYS_FORM         = 'logratio'      # 'logratio' 或 'ratio'
 J_FLOOR_PERCENT   = 1.0             # 对每个 batch 的 J_ref，下分位数百分位（1.0 表示第 1 百分位）
 J_ABS_FLOOR       = 1e-30           # 绝对地板，避免 log(0)
 
+# 调试开关：默认关闭，避免训练阶段的无关打印噪声
+DEBUG_PHYS_FLOOR  = False           # True 时打印每个 batch 的分位数自适应地板，定位物理项异常
+
 VERBOSE           = 1                # 逐 batch 打印
 PRINT_EVERY       = 1
 
@@ -354,7 +357,9 @@ def train_step_phys(x_batch, y_batch, eeq_phys_batch, step_counter):
         J_hat_c = tf.maximum(J_hat, j_floor)
         J_ref_c = tf.maximum(J_ref, j_floor)
 
-        print(j_floor)
+        # 仅在调试时打印地板，避免默认训练被刷屏
+        if DEBUG_PHYS_FLOOR:
+            tf.print("[DEBUG] J_floor (batch):", j_floor)
 
         if PHYS_FORM == 'logratio':
             r = tf.math.log(J_hat_c) - tf.math.log(J_ref_c)
@@ -372,6 +377,19 @@ def train_step_phys(x_batch, y_batch, eeq_phys_batch, step_counter):
 # ------------------------------------------------------------
 # 训练循环（逐 batch 打印，定位 NaN）
 # ------------------------------------------------------------
+# 日志格式化：集中控制字段，方便增删指标
+def _format_log(epoch, step, steps_per_epoch, out_dict):
+    return (
+        f"Epoch {epoch+1}/{EPOCHS} Step {step}/{steps_per_epoch} - "
+        f"loss: {float(out_dict['loss'].numpy()):.6e} - "
+        f"nll: {float(out_dict['nll'].numpy()):.6e} - "
+        f"kl: {float(out_dict['kl'].numpy()):.6e} - "
+        f"phys: {float(out_dict['phys'].numpy()):.6e} - "
+        f"lam:{float(out_dict['lam'].numpy()):.2e} - "
+        f"r_mean:{float(out_dict['r_mean'].numpy()):.2e} - "
+        f"J_floor:{float(out_dict['J_floor'].numpy()):.3e}"
+    )
+
 steps_per_epoch = math.ceil(X_norm_tf.shape[0] / BATCH_SIZE)
 step_counter = tf.Variable(0, dtype=tf.int64, trainable=False)
 
@@ -384,7 +402,8 @@ for epoch in range(EPOCHS):
         loss_v = float(out['loss'].numpy()); nll_v = float(out['nll'].numpy()); kl_v = float(out['kl'].numpy()); phys_v = float(out['phys'].numpy())
 
         if VERBOSE and (step % PRINT_EVERY == 0 or step==1 or step==steps_per_epoch):
-            print(f"Epoch {epoch+1}/{EPOCHS} Step {step}/{steps_per_epoch} - loss: {loss_v:.6e} - nll: {nll_v:.6e} - kl: {kl_v:.6e} - phys: {phys_v:.6e} - lam:{float(out['lam'].numpy()):.2e} - r_mean:{float(out['r_mean'].numpy()):.2e} - J_floor:{float(out['J_floor'].numpy()):.3e}")
+            # 条件打印：遵循 VERBOSE/PRINT_EVERY，便于拓展到更多指标
+            print(_format_log(epoch, step, steps_per_epoch, out))
 
         if not np.isfinite(loss_v) or not np.isfinite(nll_v) or not np.isfinite(phys_v):
             print(f"\n[NaN DETECTED] at epoch {epoch+1}, step {step}")
