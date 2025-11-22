@@ -226,177 +226,247 @@ class ARDRBFKernelLayer(keras.layers.Layer):
         return inputs
 
 # ------------------------------------------------------------
-# 读取 .mat & 数据准备
+# 数据准备
 # ------------------------------------------------------------
-mat = sio.loadmat("matlab_input.mat")
-X_np_raw = mat["data_input"]
-Y_np_raw = mat["combinedData"]
 
-# 统一 X 形状
-if X_np_raw.ndim == 2:
-    if X_np_raw.shape[-1] == 5:
-        pass
-    elif X_np_raw.shape[0] == 5:
-        X_np_raw = X_np_raw.T
+
+def load_data_and_prepare(mat_path: str = "matlab_input.mat"):
+    """读取 .mat 数据并做形状统一、校验、预处理与 E_eq 计算。
+
+    输入：mat_path 指向包含 data_input、combinedData 的 .mat 文件路径。
+    输出：预处理后的 numpy/tensor 数据字典，不在函数内触发训练，方便批量推理复用。
+    副作用：遇到非法几何或 NaN 会抛出异常，打印过滤提示。
+    """
+
+    mat = sio.loadmat(mat_path)
+    X_np_raw = mat["data_input"]
+    Y_np_raw = mat["combinedData"]
+
+    # 统一 X 形状
+    if X_np_raw.ndim == 2:
+        if X_np_raw.shape[-1] == 5:
+            pass
+        elif X_np_raw.shape[0] == 5:
+            X_np_raw = X_np_raw.T
+        else:
+            X_np_raw = np.reshape(X_np_raw, (-1, 5), order="F")
     else:
-        X_np_raw = np.reshape(X_np_raw, (-1, 5), order="F")
-else:
-    raise ValueError("data_input 维度异常，期望2D矩阵")
+        raise ValueError("data_input 维度异常，期望2D矩阵")
 
-# 统一 Y 维度
-Y_np_raw = np.atleast_2d(Y_np_raw)
-if Y_np_raw.shape[0] == 1 and Y_np_raw.shape[1] > 1:
-    Y_np_raw = Y_np_raw.T
+    # 统一 Y 维度
+    Y_np_raw = np.atleast_2d(Y_np_raw)
+    if Y_np_raw.shape[0] == 1 and Y_np_raw.shape[1] > 1:
+        Y_np_raw = Y_np_raw.T
 
-# 校验 + 预处理（warp->zscore）
-(X_warp_raw,
- X_norm,
- X_mean, X_std,
- Y_norm,
- Y_mean, Y_std,
- keep_mask_np) = validate_and_prepare(X_np_raw, Y_np_raw)
+    # 校验 + 预处理（warp->zscore）
+    (
+        X_warp_raw,
+        X_norm,
+        X_mean,
+        X_std,
+        Y_norm,
+        Y_mean,
+        Y_std,
+        keep_mask_np,
+    ) = validate_and_prepare(X_np_raw, Y_np_raw)
 
-# E_eq（使用原始几何计算）
-Eeq_np, aux = preprocess_window_eq(X_np_raw[keep_mask_np], m=20, delta_ratio=0.2)
+    # E_eq（使用原始几何计算）
+    Eeq_np, aux = preprocess_window_eq(X_np_raw[keep_mask_np], m=20, delta_ratio=0.2)
 
-# 转 Tensor
-X_norm_tf = tf.convert_to_tensor(X_norm, dtype=DTYPE)
-Y_norm_tf = tf.convert_to_tensor(Y_norm, dtype=DTYPE)
-Eeq_tf    = tf.convert_to_tensor(Eeq_np, dtype=DTYPE)
-Y_mean_tf = tf.convert_to_tensor(Y_mean, dtype=DTYPE)
-Y_std_tf  = tf.convert_to_tensor(Y_std,  dtype=DTYPE)
+    # 转 Tensor
+    X_norm_tf = tf.convert_to_tensor(X_norm, dtype=DTYPE)
+    Y_norm_tf = tf.convert_to_tensor(Y_norm, dtype=DTYPE)
+    Eeq_tf = tf.convert_to_tensor(Eeq_np, dtype=DTYPE)
+    Y_mean_tf = tf.convert_to_tensor(Y_mean, dtype=DTYPE)
+    Y_std_tf = tf.convert_to_tensor(Y_std, dtype=DTYPE)
 
-# ------------------------------------------------------------
-# 自测（不会改变训练）
-# ------------------------------------------------------------
-assert _simpson_weights(4).tolist() == [1.0, 4.0, 2.0, 4.0, 1.0]
-Xtoy = np.array([[2.0,0.5,0.2,0.0,1.0],[3.0,0.6,0.3,45.0,2.0]], dtype=np.float32)
-_e_toy,_ = preprocess_window_eq(Xtoy, m=20, delta_ratio=0.2)
-assert _e_toy.shape==(2,) and np.all(_e_toy>0)
-_tmp = X_np_raw[keep_mask_np].astype(np.float64)
-_tmp_w = _tmp.copy(); _tmp_w[:,WARP_DIM] = np.sqrt(np.maximum(0.0,_tmp_w[:,WARP_DIM])+WARP_EPS)
-_mask_other = np.ones(5, dtype=bool); _mask_other[WARP_DIM]=False
-assert np.allclose(_tmp[:,_mask_other], _tmp_w[:,_mask_other])
+    return {
+        "X_norm_np": X_norm,
+        "Y_norm_np": Y_norm,
+        "Eeq_np": Eeq_np,
+        "X_norm_tf": X_norm_tf,
+        "Y_norm_tf": Y_norm_tf,
+        "Eeq_tf": Eeq_tf,
+        "Y_mean_tf": Y_mean_tf,
+        "Y_std_tf": Y_std_tf,
+        "X_np_raw": X_np_raw,
+        "keep_mask_np": keep_mask_np,
+        "aux": aux,
+    }
 
-# ------------------------------------------------------------
-# 构建 SVGP（convert_to_tensor_fn=mean 以减轻内存）
-# ------------------------------------------------------------
-num_inducing = int(min(100, X_norm.shape[0]))
-D_out        = int(Y_norm.shape[1])
 
-inducing_init = X_norm[np.random.choice(X_norm.shape[0], size=num_inducing, replace=False)]
-inducing_init_multi = np.stack([inducing_init] * D_out, axis=0).astype(np.float64 if USE_FLOAT64 else np.float32)
+def build_model(X_norm: np.ndarray, Y_norm: np.ndarray) -> keras.Model:
+    """构建并编译 SVGP 模型，便于训练与推理复用。
 
-initial_scale = np.eye(num_inducing, dtype=np.float64 if USE_FLOAT64 else np.float32)[None, ...] * 0.1
-initial_scale = np.tile(initial_scale, (D_out, 1, 1))
+    输入：标准化后的 X_norm、Y_norm（numpy）。
+    输出：已编译好的 Keras 模型，不在此函数内执行前向或训练。
+    副作用：创建可训练权重，使用 convert_to_tensor_fn=mean 控制显存占用。
+    """
 
-vgp_layer = tfpl.VariationalGaussianProcess(
-    num_inducing_points=num_inducing,
-    kernel_provider=ARDRBFKernelLayer(amplitude=0.5, length_scale_diag=np.ones(5, np.float32), input_dim=5),
-    event_shape=(D_out,),
-    inducing_index_points_initializer=ki.Constant(inducing_init_multi),
-    unconstrained_observation_noise_variance_initializer=ki.Constant(np.log(np.expm1(NOISE0))),
-    variational_inducing_observations_scale_initializer=ki.Constant(initial_scale),
-    jitter=JITTER,
-    convert_to_tensor_fn=lambda d: d.mean(),  # 避免默认 sample 带来的大矩阵 & 随机噪声
-    name="SVGPLayer",
-)
+    num_inducing = int(min(100, X_norm.shape[0]))
+    D_out = int(Y_norm.shape[1])
 
-model = keras.Sequential([
-    keras.layers.InputLayer(input_shape=[5], dtype=DTYPE),
-    vgp_layer,
-])
+    inducing_init = X_norm[np.random.choice(X_norm.shape[0], size=num_inducing, replace=False)]
+    inducing_init_multi = np.stack([inducing_init] * D_out, axis=0).astype(np.float64 if USE_FLOAT64 else np.float32)
 
-# ELBO 损失
+    initial_scale = np.eye(num_inducing, dtype=np.float64 if USE_FLOAT64 else np.float32)[None, ...] * 0.1
+    initial_scale = np.tile(initial_scale, (D_out, 1, 1))
 
-def negloglik(y_true, rv_pred):
-    return -rv_pred.log_prob(y_true)
+    vgp_layer = tfpl.VariationalGaussianProcess(
+        num_inducing_points=num_inducing,
+        kernel_provider=ARDRBFKernelLayer(
+            amplitude=0.5, length_scale_diag=np.ones(5, np.float32), input_dim=5
+        ),
+        event_shape=(D_out,),
+        inducing_index_points_initializer=ki.Constant(inducing_init_multi),
+        unconstrained_observation_noise_variance_initializer=ki.Constant(np.log(np.expm1(NOISE0))),
+        variational_inducing_observations_scale_initializer=ki.Constant(initial_scale),
+        jitter=JITTER,
+        convert_to_tensor_fn=lambda d: d.mean(),  # 避免默认 sample 带来的大矩阵 & 随机噪声
+        name="SVGPLayer",
+    )
 
-optimizer = keras.optimizers.Adam(LEARNING_RATE, clipnorm=1.0)
-model.compile(optimizer=optimizer, loss=negloglik)
+    model = keras.Sequential(
+        [
+            keras.layers.InputLayer(input_shape=[5], dtype=DTYPE),
+            vgp_layer,
+        ]
+    )
 
-# dry-run：确保前向有限
-M = int(min(32, X_norm_tf.shape[0]))
-rv0 = model(X_norm_tf[:M], training=False)
-ll0 = rv0.log_prob(Y_norm_tf[:M]).numpy()
-if not np.isfinite(ll0).all():
-    raise RuntimeError("Dry-run log_prob 非有限：请提高 jitter/噪声或检查数据尺度。")
+    def negloglik(y_true, rv_pred):
+        return -rv_pred.log_prob(y_true)
 
-# ------------------------------------------------------------
-# 物理正则：log-ratio + 分位数地板 + warmup
-# ------------------------------------------------------------
-@tf.function
-def train_step_phys(x_batch, y_batch, eeq_phys_batch, step_counter):
-    # 线性 warmup：从 0 → PHYS_TARGET_LAM
-    lam = tf.cast(PHYS_TARGET_LAM, DTYPE) * tf.minimum(1.0, tf.cast(step_counter, DTYPE)/tf.cast(PHYS_WARMUP_STEPS, DTYPE))
+    optimizer = keras.optimizers.Adam(LEARNING_RATE, clipnorm=1.0)
+    model.compile(optimizer=optimizer, loss=negloglik)
+    return model
 
-    with tf.GradientTape() as tape:
-        rv = model(x_batch, training=True)
-        nll = -tf.reduce_mean(rv.log_prob(y_batch))
-        kl  = tf.add_n(model.losses) if model.losses else tf.cast(0.0, DTYPE)
 
-        # 反标准化到物理量
-        K_pred = rv.mean()*Y_std_tf + Y_mean_tf
-        K_true = y_batch*Y_std_tf + Y_mean_tf
+def run_training(model: keras.Model, data: dict):
+    """执行自测、数据集构建与训练循环，避免 import 时自动跑训练。
 
-        # E'：平面应变（或应力）
-        Eprime = eeq_phys_batch/(1.0-NU**2)  # 若是平面应力，替换为 eeq_phys_batch
+    输入：模型实例与 load_data_and_prepare 返回的数据字典。
+    输出：无显式返回（训练在函数内执行），方便未来扩展推理接口时直接复用模型与预处理资产。
+    副作用：在控制台打印 loss/物理指标，检测到 NaN 会抛异常并打印辅助统计。
+    """
 
-        # 物理 J（带地板）
-        eps = tf.cast(J_ABS_FLOOR, DTYPE)
-        J_hat = tf.reduce_sum(tf.square(K_pred), axis=-1) / (Eprime + eps)
-        J_ref = tf.reduce_sum(tf.square(K_true), axis=-1) / (Eprime + eps)
+    X_norm_tf = data["X_norm_tf"]
+    Y_norm_tf = data["Y_norm_tf"]
+    Eeq_tf = data["Eeq_tf"]
+    Y_mean_tf = data["Y_mean_tf"]
+    Y_std_tf = data["Y_std_tf"]
+    X_np_raw = data["X_np_raw"]
+    keep_mask_np = data["keep_mask_np"]
 
-        # 分位数自适应地板（按 batch）
-        # 说明：小数据/极小 J 会导致 log/比值不稳定，这里对两者同时加地板，保障数值稳定且不破坏相对尺度。
-        j_floor = tfp.stats.percentile(J_ref, q=tf.cast(J_FLOOR_PERCENT, tf.float32))
-        j_floor = tf.maximum(j_floor, eps)
-        J_hat_c = tf.maximum(J_hat, j_floor)
-        J_ref_c = tf.maximum(J_ref, j_floor)
+    # 自测（不会改变训练）
+    assert _simpson_weights(4).tolist() == [1.0, 4.0, 2.0, 4.0, 1.0]
+    Xtoy = np.array([[2.0, 0.5, 0.2, 0.0, 1.0], [3.0, 0.6, 0.3, 45.0, 2.0]], dtype=np.float32)
+    _e_toy, _ = preprocess_window_eq(Xtoy, m=20, delta_ratio=0.2)
+    assert _e_toy.shape == (2,) and np.all(_e_toy > 0)
+    _tmp = X_np_raw[keep_mask_np].astype(np.float64)
+    _tmp_w = _tmp.copy(); _tmp_w[:, WARP_DIM] = np.sqrt(np.maximum(0.0, _tmp_w[:, WARP_DIM]) + WARP_EPS)
+    _mask_other = np.ones(5, dtype=bool); _mask_other[WARP_DIM] = False
+    assert np.allclose(_tmp[:, _mask_other], _tmp_w[:, _mask_other])
 
-        print(j_floor)
+    # dry-run：确保前向有限
+    M = int(min(32, X_norm_tf.shape[0]))
+    rv0 = model(X_norm_tf[:M], training=False)
+    ll0 = rv0.log_prob(Y_norm_tf[:M]).numpy()
+    if not np.isfinite(ll0).all():
+        raise RuntimeError("Dry-run log_prob 非有限：请提高 jitter/噪声或检查数据尺度。")
 
-        if PHYS_FORM == 'logratio':
-            r = tf.math.log(J_hat_c) - tf.math.log(J_ref_c)
-        else:  # 'ratio'
-            r = J_hat_c / J_ref_c - 1.0
-        phys = tf.reduce_mean(tf.square(r)) * lam
+    # 物理正则：log-ratio + 分位数地板 + warmup
+    @tf.function
+    def train_step_phys(x_batch, y_batch, eeq_phys_batch, step_counter):
+        # 线性 warmup：从 0 → PHYS_TARGET_LAM
+        lam = tf.cast(PHYS_TARGET_LAM, DTYPE) * tf.minimum(
+            1.0, tf.cast(step_counter, DTYPE) / tf.cast(PHYS_WARMUP_STEPS, DTYPE)
+        )
 
-        loss = nll + kl + phys
+        with tf.GradientTape() as tape:
+            rv = model(x_batch, training=True)
+            nll = -tf.reduce_mean(rv.log_prob(y_batch))
+            kl = tf.add_n(model.losses) if model.losses else tf.cast(0.0, DTYPE)
 
-    grads = tape.gradient(loss, model.trainable_variables)
-    model.optimizer.apply_gradients(zip(grads, model.trainable_variables))
-    return {"loss": loss, "nll": nll, "kl": kl, "phys": phys, "lam": lam,
-            "r_mean": tf.reduce_mean(r), "J_floor": j_floor}
+            # 反标准化到物理量
+            K_pred = rv.mean() * Y_std_tf + Y_mean_tf
+            K_true = y_batch * Y_std_tf + Y_mean_tf
 
-# ------------------------------------------------------------
-# 训练循环（逐 batch 打印，定位 NaN）
-# ------------------------------------------------------------
-steps_per_epoch = math.ceil(X_norm_tf.shape[0] / BATCH_SIZE)
-step_counter = tf.Variable(0, dtype=tf.int64, trainable=False)
+            # E'：平面应变（或应力）
+            Eprime = eeq_phys_batch / (1.0 - NU**2)  # 若是平面应力，替换为 eeq_phys_batch
 
-for epoch in range(EPOCHS):
-    ds = tf.data.Dataset.from_tensor_slices((X_norm_tf, Y_norm_tf, Eeq_tf)).shuffle(4096).batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+            # 物理 J（带地板）
+            eps = tf.cast(J_ABS_FLOOR, DTYPE)
+            J_hat = tf.reduce_sum(tf.square(K_pred), axis=-1) / (Eprime + eps)
+            J_ref = tf.reduce_sum(tf.square(K_true), axis=-1) / (Eprime + eps)
 
-    for step, (xb, yb, eb) in enumerate(ds, start=1):
-        step_counter.assign_add(1)
-        out = train_step_phys(xb, yb, eb, step_counter)
-        loss_v = float(out['loss'].numpy()); nll_v = float(out['nll'].numpy()); kl_v = float(out['kl'].numpy()); phys_v = float(out['phys'].numpy())
+            # 分位数自适应地板（按 batch）
+            # 说明：小数据/极小 J 会导致 log/比值不稳定，这里对两者同时加地板，保障数值稳定且不破坏相对尺度。
+            j_floor = tfp.stats.percentile(J_ref, q=tf.cast(J_FLOOR_PERCENT, tf.float32))
+            j_floor = tf.maximum(j_floor, eps)
+            J_hat_c = tf.maximum(J_hat, j_floor)
+            J_ref_c = tf.maximum(J_ref, j_floor)
 
-        if VERBOSE and (step % PRINT_EVERY == 0 or step==1 or step==steps_per_epoch):
-            print(f"Epoch {epoch+1}/{EPOCHS} Step {step}/{steps_per_epoch} - loss: {loss_v:.6e} - nll: {nll_v:.6e} - kl: {kl_v:.6e} - phys: {phys_v:.6e} - lam:{float(out['lam'].numpy()):.2e} - r_mean:{float(out['r_mean'].numpy()):.2e} - J_floor:{float(out['J_floor'].numpy()):.3e}")
+            print(j_floor)
 
-        if not np.isfinite(loss_v) or not np.isfinite(nll_v) or not np.isfinite(phys_v):
-            print(f"\n[NaN DETECTED] at epoch {epoch+1}, step {step}")
-            # 打印该 batch 的安全统计，便于定位
-            Kp = (model(xb, training=False).mean()*Y_std_tf + Y_mean_tf).numpy()
-            Kt = (yb*Y_std_tf + Y_mean_tf).numpy()
-            print("K_pred stats -> min/median/max:", np.nanmin(Kp), np.nanmedian(Kp), np.nanmax(Kp))
-            print("K_true stats -> min/median/max:", np.nanmin(Kt), np.nanmedian(Kt), np.nanmax(Kt))
-            Eb = eb.numpy(); print("E' stats -> min/median/max:", np.nanmin(Eb/(1-NU**2)), np.nanmedian(Eb/(1-NU**2)), np.nanmax(Eb/(1-NU**2)))
-            raise RuntimeError("Loss became NaN/Inf; see stats above.")
+            if PHYS_FORM == "logratio":
+                r = tf.math.log(J_hat_c) - tf.math.log(J_ref_c)
+            else:  # 'ratio'
+                r = J_hat_c / J_ref_c - 1.0
+            phys = tf.reduce_mean(tf.square(r)) * lam
 
-    print(f"epoch {epoch+1} done")
+            loss = nll + kl + phys
+
+        grads = tape.gradient(loss, model.trainable_variables)
+        model.optimizer.apply_gradients(zip(grads, model.trainable_variables))
+        return {
+            "loss": loss,
+            "nll": nll,
+            "kl": kl,
+            "phys": phys,
+            "lam": lam,
+            "r_mean": tf.reduce_mean(r),
+            "J_floor": j_floor,
+        }
+
+    # 训练循环（逐 batch 打印，定位 NaN）
+    steps_per_epoch = math.ceil(X_norm_tf.shape[0] / BATCH_SIZE)
+    step_counter = tf.Variable(0, dtype=tf.int64, trainable=False)
+
+    for epoch in range(EPOCHS):
+        ds = (
+            tf.data.Dataset.from_tensor_slices((X_norm_tf, Y_norm_tf, Eeq_tf))
+            .shuffle(4096)
+            .batch(BATCH_SIZE)
+            .prefetch(tf.data.AUTOTUNE)
+        )
+
+        for step, (xb, yb, eb) in enumerate(ds, start=1):
+            step_counter.assign_add(1)
+            out = train_step_phys(xb, yb, eb, step_counter)
+            loss_v = float(out["loss"].numpy()); nll_v = float(out["nll"].numpy()); kl_v = float(out["kl"].numpy()); phys_v = float(out["phys"].numpy())
+
+            if VERBOSE and (step % PRINT_EVERY == 0 or step == 1 or step == steps_per_epoch):
+                print(
+                    f"Epoch {epoch+1}/{EPOCHS} Step {step}/{steps_per_epoch} - loss: {loss_v:.6e} - nll: {nll_v:.6e} - kl: {kl_v:.6e} - phys: {phys_v:.6e} - lam:{float(out['lam'].numpy()):.2e} - r_mean:{float(out['r_mean'].numpy()):.2e} - J_floor:{float(out['J_floor'].numpy()):.3e}"
+                )
+
+            if not np.isfinite(loss_v) or not np.isfinite(nll_v) or not np.isfinite(phys_v):
+                print(f"\n[NaN DETECTED] at epoch {epoch+1}, step {step}")
+                # 打印该 batch 的安全统计，便于定位
+                Kp = (model(xb, training=False).mean() * Y_std_tf + Y_mean_tf).numpy()
+                Kt = (yb * Y_std_tf + Y_mean_tf).numpy()
+                print("K_pred stats -> min/median/max:", np.nanmin(Kp), np.nanmedian(Kp), np.nanmax(Kp))
+                print("K_true stats -> min/median/max:", np.nanmin(Kt), np.nanmedian(Kt), np.nanmax(Kt))
+                Eb = eb.numpy(); print("E' stats -> min/median/max:", np.nanmin(Eb / (1 - NU**2)), np.nanmedian(Eb / (1 - NU**2)), np.nanmax(Eb / (1 - NU**2)))
+                raise RuntimeError("Loss became NaN/Inf; see stats above.")
+
+        print(f"epoch {epoch+1} done")
+
+
+if __name__ == "__main__":
+    data_bundle = load_data_and_prepare()
+    model = build_model(data_bundle["X_norm_np"], data_bundle["Y_norm_np"])
+    run_training(model, data_bundle)
 
 # ------------------------------------------------------------
 # 批量预测工具（避免一次性对全部样本构造 K(X,X) 导致 OOM）
