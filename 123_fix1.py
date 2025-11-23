@@ -424,7 +424,7 @@ def load_data_and_prepare(mat_path: str = "matlab_input.mat"):
     )
 
 
-def build_model(X_norm: np.ndarray, Y_norm: np.ndarray):
+def build_model(X_norm: np.ndarray, Y_norm: np.ndarray, total_steps: int):
     """构建 SVGP 模型（convert_to_tensor_fn=mean 以减轻内存）。"""
     num_inducing = int(min(100, X_norm.shape[0]))
     D_out        = int(Y_norm.shape[1])
@@ -455,8 +455,14 @@ def build_model(X_norm: np.ndarray, Y_norm: np.ndarray):
     def negloglik(y_true, rv_pred):
         return -rv_pred.log_prob(y_true)
 
+    lr_schedule = keras.optimizers.schedules.CosineDecay(
+        initial_learning_rate=LEARNING_RATE,
+        decay_steps=total_steps,
+        alpha=0.01,
+    )
+
     optimizer = ShojiNaturalGradient(
-        learning_rate=LEARNING_RATE,
+        learning_rate=lr_schedule,
         momentum=0.9,
         angle_threshold=0.1,
         global_clipnorm=1.0,
@@ -575,7 +581,8 @@ def run_training(model: keras.Model, data: dict):
 
 def main():
     data = load_data_and_prepare()
-    model = build_model(data["X_norm"], data["Y_norm"])
+    total_steps = EPOCHS * math.ceil(data["X_norm"].shape[0] / BATCH_SIZE)
+    model = build_model(data["X_norm"], data["Y_norm"], total_steps)
     _dry_run(model, data["X_norm_tf"], data["Y_norm_tf"])
     run_training(model, data)
 
