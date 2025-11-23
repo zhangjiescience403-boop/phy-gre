@@ -424,8 +424,15 @@ def load_data_and_prepare(mat_path: str = "matlab_input.mat"):
     )
 
 
-def build_model(X_norm: np.ndarray, Y_norm: np.ndarray, total_steps: int):
+def build_model(
+    X_norm: np.ndarray, Y_norm: np.ndarray, total_steps: int | None = None
+):
     """构建 SVGP 模型（convert_to_tensor_fn=mean 以减轻内存）。"""
+    if total_steps is None:
+        batches_per_epoch = math.ceil(X_norm.shape[0] / BATCH_SIZE)
+        total_steps = EPOCHS * batches_per_epoch
+    total_steps = max(1, int(total_steps))
+
     num_inducing = int(min(100, X_norm.shape[0]))
     D_out        = int(Y_norm.shape[1])
 
