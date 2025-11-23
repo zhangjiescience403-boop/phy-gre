@@ -585,6 +585,10 @@ def main():
     model = build_model(data["X_norm"], data["Y_norm"], total_steps)
     _dry_run(model, data["X_norm_tf"], data["Y_norm_tf"])
     run_training(model, data)
+    
+    save_path = "svgp_shoji_weights.h5"
+    model.save_weights(save_path)
+    print(f"\n[System] Model weights saved to: {save_path}")
 
 
 if __name__ == "__main__":
@@ -605,4 +609,5 @@ def predict_mean_batched(model, X_tf: tf.Tensor, batch_size: int = 8192):
 # 示例：仅在需要时调用
 # pred_norm = predict_mean_batched(model, X_norm_tf, batch_size=4096)
 # print("Predictive mean (first 3 rows, normalized):\n", pred_norm[:3])
+
 
