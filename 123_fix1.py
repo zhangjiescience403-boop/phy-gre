@@ -30,6 +30,77 @@ tfpl = tfp.layers
 ki   = keras.initializers
 
 # ------------------------------------------------------------
+# 优化器：ShojiNaturalGradient（Theorem B' with Strict Acute Angle Constraint）
+# ------------------------------------------------------------
+
+
+class ShojiNaturalGradient(keras.optimizers.Optimizer):
+    """Shoji 等（2024）Theorem B' 的 O(D) 版本，并加入严格锐角约束。"""
+
+    def __init__(
+        self,
+        learning_rate=0.001,
+        momentum=0.9,
+        angle_threshold=0.1,
+        global_clipnorm=None,
+        name="ShojiNaturalGradient",
+        **kwargs,
+    ):
+        super().__init__(
+            name=name,
+            clipnorm=None,
+            global_clipnorm=global_clipnorm,
+            **kwargs,
+        )
+        self._set_hyper("learning_rate", learning_rate)
+        self._set_hyper("momentum", momentum)
+        self.angle_threshold = angle_threshold
+
+    def _create_slots(self, var_list):
+        for var in var_list:
+            self.add_slot(var, "g", initializer="zeros")
+
+    def _resource_apply_dense(self, grad, var):
+        lr = self._decayed_lr(var.dtype)
+        beta = tf.cast(self._get_hyper("momentum", var.dtype), var.dtype)
+        angle_th = tf.cast(self.angle_threshold, var.dtype)
+        eps_div = tf.cast(1e-12, var.dtype)
+
+        g_prev = self.get_slot(var, "g")
+        y = -grad
+        g_cand = beta * g_prev + (1.0 - beta) * y
+
+        cos_sim = tf.reduce_sum(y * g_cand) / (
+            tf.norm(y) * tf.norm(g_cand) + eps_div
+        )
+
+        def reset_dir():
+            return y
+
+        def keep_dir():
+            return g_cand
+
+        # 硬重置：当夹角过钝（cos 过小）时回退到 y_t，避免 Shoji 度量奇异。
+        g_new = tf.cond(cos_sim < angle_th, reset_dir, keep_dir)
+
+        g_update = g_prev.assign(g_new, use_locking=self._use_locking)
+        var_update = var.assign_add(lr * g_new, use_locking=self._use_locking)
+        return tf.group(var_update, g_update)
+
+    def _resource_apply_sparse(self, grad, var, indices=None):
+        dense_grad = tf.convert_to_tensor(grad)
+        return self._resource_apply_dense(dense_grad, var)
+
+    def get_config(self):
+        base_config = super().get_config()
+        return {
+            **base_config,
+            "learning_rate": self._serialize_hyperparameter("learning_rate"),
+            "momentum": self._serialize_hyperparameter("momentum"),
+            "angle_threshold": self.angle_threshold,
+        }
+
+# ------------------------------------------------------------
 # 可调参数
 # ------------------------------------------------------------
 USE_FLOAT64    = False             # 如需更稳可设 True（并把 JITTER 降到 1e-5 左右）
@@ -381,7 +452,12 @@ def build_model(X_norm: np.ndarray, Y_norm: np.ndarray):
     def negloglik(y_true, rv_pred):
         return -rv_pred.log_prob(y_true)
 
-    optimizer = keras.optimizers.Adam(LEARNING_RATE, clipnorm=1.0)
+    optimizer = ShojiNaturalGradient(
+        learning_rate=LEARNING_RATE,
+        momentum=0.9,
+        angle_threshold=0.1,
+        global_clipnorm=1.0,
+    )
     model.compile(optimizer=optimizer, loss=negloglik)
     return model
 
