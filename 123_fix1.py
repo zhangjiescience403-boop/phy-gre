@@ -17,12 +17,15 @@
 # =============================================================================
 
 import os
+# 强制使用遗留版 Keras (双重保险)
+os.environ["TF_USE_LEGACY_KERAS"] = "1"
+
 import math
 import numpy as np
 import scipy.io as sio
 import tensorflow as tf
 import tensorflow_probability as tfp
-import tf_keras as keras
+import tensorflow.keras as keras
 
 # 简写
 tfk  = tfp.math.psd_kernels
@@ -34,7 +37,7 @@ ki   = keras.initializers
 # ------------------------------------------------------------
 
 
-class ShojiNaturalGradient(keras.optimizers.Optimizer):
+class ShojiNaturalGradient(keras.optimizers.legacy.Optimizer):
     """Shoji 等（2024）Theorem B' 的 O(D) 版本，并加入严格锐角约束。"""
 
     def __init__(
@@ -595,3 +598,4 @@ def predict_mean_batched(model, X_tf: tf.Tensor, batch_size: int = 8192):
 # 示例：仅在需要时调用
 # pred_norm = predict_mean_batched(model, X_norm_tf, batch_size=4096)
 # print("Predictive mean (first 3 rows, normalized):\n", pred_norm[:3])
+
