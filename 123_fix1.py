@@ -487,8 +487,9 @@ def _dry_run(model: keras.Model, X_norm_tf: tf.Tensor, Y_norm_tf: tf.Tensor):
         raise RuntimeError("Dry-run log_prob 非有限：请提高 jitter/噪声或检查数据尺度。")
 
 
-def make_train_step(model: keras.Model, Y_std_tf: tf.Tensor, Y_mean_tf: tf.Tensor):
+def make_train_step(model: keras.Model, Y_std_tf: tf.Tensor, Y_mean_tf: tf.Tensor, kl_scale: float):
     """返回带物理正则的单步训练函数，封装 warmup/地板/ratio 选择。"""
+    kl_scale_tf = tf.cast(kl_scale, DTYPE)
     @tf.function
     def train_step_phys(x_batch, y_batch, eeq_phys_batch, step_counter):
         # 线性 warmup：从 0 → PHYS_TARGET_LAM
@@ -497,7 +498,11 @@ def make_train_step(model: keras.Model, Y_std_tf: tf.Tensor, Y_mean_tf: tf.Tenso
         with tf.GradientTape() as tape:
             rv = model(x_batch, training=True)
             nll = -tf.reduce_mean(rv.log_prob(y_batch))
-            kl  = tf.add_n(model.losses) if model.losses else tf.cast(0.0, DTYPE)
+            if model.losses:
+                kl_raw = tf.add_n(model.losses)
+                kl = kl_scale_tf * tf.cast(kl_raw, DTYPE)
+            else:
+                kl = tf.cast(0.0, DTYPE)
 
             # 反标准化到物理量（确保正则作用在真实尺度上）
             K_pred = rv.mean()*Y_std_tf + Y_mean_tf
@@ -544,7 +549,9 @@ def make_train_step(model: keras.Model, Y_std_tf: tf.Tensor, Y_mean_tf: tf.Tenso
 
 def run_training(model: keras.Model, data: dict):
     """训练主循环：构建 Dataset、迭代 epochs，并打印可控日志。"""
-    train_step_phys = make_train_step(model, data["Y_std_tf"], data["Y_mean_tf"])
+    total_train_samples = data["X_norm_tf"].shape[0]
+    kl_scale = 1.0 / float(total_train_samples)
+    train_step_phys = make_train_step(model, data["Y_std_tf"], data["Y_mean_tf"], kl_scale)
     steps_per_epoch = math.ceil(data["X_norm_tf"].shape[0] / BATCH_SIZE)
     step_counter = tf.Variable(0, dtype=tf.int64, trainable=False)
 

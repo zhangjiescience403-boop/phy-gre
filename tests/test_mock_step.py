@@ -58,7 +58,8 @@ def test_single_step_shapes():
     assert rv.mean().shape == Y_norm_tf.shape
 
     # 单步训练，检查返回标量是否有限
-    train_step = svgp_fix_module.make_train_step(model, Y_std_tf, Y_mean_tf)
+    kl_scale = 1.0 / float(X_norm_tf.shape[0])
+    train_step = svgp_fix_module.make_train_step(model, Y_std_tf, Y_mean_tf, kl_scale)
     step_counter = tf.Variable(1, dtype=tf.int64)
     out = train_step(X_norm_tf, Y_norm_tf, Eeq_tf, step_counter)
 
