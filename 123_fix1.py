@@ -491,9 +491,8 @@ def make_train_step(model: keras.Model, Y_std_tf: tf.Tensor, Y_mean_tf: tf.Tenso
     """返回带物理正则的单步训练函数，封装 warmup/地板/ratio 选择。"""
     kl_scale_tf = tf.cast(kl_scale, DTYPE)
     @tf.function
-    def train_step_phys(x_batch, y_batch, eeq_phys_batch, step_counter):
-        # 线性 warmup：从 0 → PHYS_TARGET_LAM
-        lam = tf.cast(PHYS_TARGET_LAM, DTYPE) * tf.minimum(1.0, tf.cast(step_counter, DTYPE)/tf.cast(PHYS_WARMUP_STEPS, DTYPE))
+    def train_step_phys(x_batch, y_batch, eeq_phys_batch, lam_value):
+        lam = tf.cast(lam_value, DTYPE)
 
         with tf.GradientTape() as tape:
             rv = model(x_batch, training=True)
@@ -553,7 +552,7 @@ def run_training(model: keras.Model, data: dict):
     kl_scale = 1.0 / float(total_train_samples)
     train_step_phys = make_train_step(model, data["Y_std_tf"], data["Y_mean_tf"], kl_scale)
     steps_per_epoch = math.ceil(data["X_norm_tf"].shape[0] / BATCH_SIZE)
-    step_counter = tf.Variable(0, dtype=tf.int64, trainable=False)
+    global_step = 0
 
     for epoch in range(EPOCHS):
         ds = (
@@ -564,8 +563,9 @@ def run_training(model: keras.Model, data: dict):
         )
 
         for step, (xb, yb, eb) in enumerate(ds, start=1):
-            step_counter.assign_add(1)
-            out = train_step_phys(xb, yb, eb, step_counter)
+            global_step += 1
+            current_lam = PHYS_TARGET_LAM * min(1.0, global_step / PHYS_WARMUP_STEPS)
+            out = train_step_phys(xb, yb, eb, current_lam)
             metrics = {
                 "loss": float(out['loss'].numpy()),
                 "nll": float(out['nll'].numpy()),
