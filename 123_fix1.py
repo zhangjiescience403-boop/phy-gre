@@ -106,14 +106,15 @@ class ShojiNaturalGradient(keras.optimizers.legacy.Optimizer):
 # ------------------------------------------------------------
 # 可调参数
 # ------------------------------------------------------------
-USE_FLOAT64    = False             # 如需更稳可设 True（并把 JITTER 降到 1e-5 左右）
+USE_FLOAT64    = True              # 如需更稳可设 True（并把 JITTER 降到 1e-5 左右）
 DTYPE          = tf.float64 if USE_FLOAT64 else tf.float32
+NP_DTYPE       = np.float64 if USE_FLOAT64 else np.float32
 np.random.seed(42); tf.random.set_seed(42)
 tf.keras.backend.set_floatx('float64' if USE_FLOAT64 else 'float32')
 
 # 训练超参
 LEARNING_RATE  = 1e-3
-EPOCHS         = 10
+EPOCHS         = 50
 BATCH_SIZE     = 256
 JITTER         = 1e-4
 NU             = 0.30               # 泊松比
@@ -138,9 +139,9 @@ DEBUG_PHYS_FLOOR  = False            # 是否打印 batch 分位数地板，默�
 
 def _simpson_weights(m: int) -> np.ndarray:
     assert m % 2 == 0 and m > 0
-    w = np.ones(m + 1, dtype=np.float64)
-    w[1:-1:2] = 4.0
-    w[2:-1:2] = 2.0
+    w = np.ones(m + 1, dtype=NP_DTYPE)
+    w[1:-1:2] = NP_DTYPE(4.0)
+    w[2:-1:2] = NP_DTYPE(2.0)
     return w
 
 
@@ -157,7 +158,7 @@ def preprocess_window_eq(X_np: np.ndarray, m=20, delta_ratio=0.2):
 
     # 拆分特征并强制使用 float64 保持积分精度
     N = X_np.shape[0]
-    Ro, Rn, crack_n, theta_deg, n_FGM = [X_np[:, i].astype(np.float64) for i in range(5)]
+    Ro, Rn, crack_n, theta_deg, n_FGM = [X_np[:, i].astype(NP_DTYPE) for i in range(5)]
 
     # 由几何关系得到内半径/裂尖位置/壁厚等中间量
     Ri = Rn * Ro                     # 内半径 = 比例 * 外半径
@@ -192,13 +193,13 @@ def preprocess_window_eq(X_np: np.ndarray, m=20, delta_ratio=0.2):
     w = _simpson_weights(m)
 
     # 构造等效模量积分：预先定义梯度材料的 E(r)
-    Eeq = np.zeros(N, dtype=np.float64)
-    E0 = 214e9
-    dE = 166e9
+    Eeq = np.zeros(N, dtype=NP_DTYPE)
+    E0 = NP_DTYPE(214e9)
+    dE = NP_DTYPE(166e9)
 
     for i in range(N):
         # r_i: 对称窗口内的积分网格（截断到合法区间）
-        r_i = left[i] + h[i] * np.arange(m + 1, dtype=np.float64)
+        r_i = left[i] + h[i] * np.arange(m + 1, dtype=NP_DTYPE)
         r_i = np.clip(r_i, Rp[i], Rp[i] + Dp[i])
 
         # xi: 归一化径向坐标，Ei: 对应梯度模量分布
@@ -215,7 +216,7 @@ def preprocess_window_eq(X_np: np.ndarray, m=20, delta_ratio=0.2):
         r_tip=r_tip, left=left, right=right, h=h,
         m=m, delta_ratio=delta_ratio,
     )
-    return Eeq.astype(np.float32), aux
+    return Eeq.astype(NP_DTYPE), aux
 
 # ------------------------------------------------------------
 # 数据校验 & 预处理：先 warp(crack_n) 再 z-score
@@ -252,8 +253,8 @@ def validate_and_prepare(X_raw: np.ndarray, Y_raw: np.ndarray):
     if not keep_mask.all():
         bad = np.where(~keep_mask)[0]
         print(f"警告：移除含 NaN/Inf 样本 {bad.shape[0]} 行，示例索引: {bad[:10]}")
-    Xc = X_raw[keep_mask].astype(np.float64)
-    Yc = Y_raw[keep_mask].astype(np.float64)
+    Xc = X_raw[keep_mask].astype(NP_DTYPE)
+    Yc = Y_raw[keep_mask].astype(NP_DTYPE)
 
     # 物理约束：半径比例与裂纹比例均应在 (0,1)
     Ro  = Xc[:,0]; Rn = Xc[:,1]; crack_n = Xc[:,2]
@@ -300,9 +301,9 @@ def validate_and_prepare(X_raw: np.ndarray, Y_raw: np.ndarray):
         raise ValueError(f"Y_norm 含非有限值，位置示例: {bad}")
 
     return (
-        X_warp.astype(np.float32),
-        X_norm.astype(np.float32), X_mean.astype(np.float32), X_std.astype(np.float32),
-        Y_norm.astype(np.float32), Y_mean.astype(np.float32), Y_std.astype(np.float32),
+        X_warp.astype(NP_DTYPE),
+        X_norm.astype(NP_DTYPE), X_mean.astype(NP_DTYPE), X_std.astype(NP_DTYPE),
+        Y_norm.astype(NP_DTYPE), Y_mean.astype(NP_DTYPE), Y_std.astype(NP_DTYPE),
         keep_mask,
     )
 
@@ -313,7 +314,7 @@ class ARDRBFKernelLayer(keras.layers.Layer):
     def __init__(self, amplitude=0.5, length_scale_diag=None, input_dim=5, **kwargs):
         super().__init__(**kwargs)
         if length_scale_diag is None:
-            length_scale_diag = np.ones([input_dim], np.float32)
+            length_scale_diag = np.ones([input_dim], NP_DTYPE)
         self._amp_unconstrained = self.add_weight(
             name="amplitude", shape=[],
             initializer=ki.Constant(np.log(np.expm1(amplitude))),
@@ -349,12 +350,12 @@ def _format_log(epoch: int, step: int, steps_per_epoch: int, metrics: dict) -> s
 def _self_check(X_np_raw: np.ndarray, keep_mask_np: np.ndarray, X_norm_tf: tf.Tensor, X_mean: np.ndarray, X_std: np.ndarray):
     """轻量自测，确保关键计算与 warp 一致，便于导入模块时快速发现问题。"""
     assert _simpson_weights(4).tolist() == [1.0, 4.0, 2.0, 4.0, 1.0]
-    Xtoy = np.array([[2.0,0.5,0.2,0.0,1.0],[3.0,0.6,0.3,45.0,2.0]], dtype=np.float32)
+    Xtoy = np.array([[2.0,0.5,0.2,0.0,1.0],[3.0,0.6,0.3,45.0,2.0]], dtype=NP_DTYPE)
     _e_toy,_ = preprocess_window_eq(Xtoy, m=20, delta_ratio=0.2)
     assert _e_toy.shape==(2,) and np.all(_e_toy>0)
 
     # warp 一致性检查：除 warp 维度外保持一致
-    _tmp = X_np_raw[keep_mask_np].astype(np.float64)
+    _tmp = X_np_raw[keep_mask_np].astype(NP_DTYPE)
     _tmp_w = _tmp.copy(); _tmp_w[:,WARP_DIM] = np.sqrt(np.maximum(0.0,_tmp_w[:,WARP_DIM])+WARP_EPS)
     _mask_other = np.ones(5, dtype=bool); _mask_other[WARP_DIM]=False
     assert np.allclose(_tmp[:,_mask_other], _tmp_w[:,_mask_other])
@@ -426,18 +427,18 @@ def load_data_and_prepare(mat_path: str = "matlab_input.mat"):
 
 def build_model(X_norm: np.ndarray, Y_norm: np.ndarray, total_steps: int):
     """构建 SVGP 模型（convert_to_tensor_fn=mean 以减轻内存）。"""
-    num_inducing = int(min(100, X_norm.shape[0]))
+    num_inducing = int(min(1000, X_norm.shape[0]))
     D_out        = int(Y_norm.shape[1])
 
     inducing_init = X_norm[np.random.choice(X_norm.shape[0], size=num_inducing, replace=False)]
-    inducing_init_multi = np.stack([inducing_init] * D_out, axis=0).astype(np.float64 if USE_FLOAT64 else np.float32)
+    inducing_init_multi = np.stack([inducing_init] * D_out, axis=0).astype(NP_DTYPE)
 
-    initial_scale = np.eye(num_inducing, dtype=np.float64 if USE_FLOAT64 else np.float32)[None, ...] * 0.1
+    initial_scale = np.eye(num_inducing, dtype=NP_DTYPE)[None, ...] * 0.1
     initial_scale = np.tile(initial_scale, (D_out, 1, 1))
 
     vgp_layer = tfpl.VariationalGaussianProcess(
         num_inducing_points=num_inducing,
-        kernel_provider=ARDRBFKernelLayer(amplitude=0.5, length_scale_diag=np.ones(5, np.float32), input_dim=5),
+        kernel_provider=ARDRBFKernelLayer(amplitude=0.5, length_scale_diag=np.ones(5, NP_DTYPE), input_dim=5),
         event_shape=(D_out,),
         inducing_index_points_initializer=ki.Constant(inducing_init_multi),
         unconstrained_observation_noise_variance_initializer=ki.Constant(np.log(np.expm1(NOISE0))),
@@ -483,9 +484,8 @@ def _dry_run(model: keras.Model, X_norm_tf: tf.Tensor, Y_norm_tf: tf.Tensor):
 def make_train_step(model: keras.Model, Y_std_tf: tf.Tensor, Y_mean_tf: tf.Tensor):
     """返回带物理正则的单步训练函数，封装 warmup/地板/ratio 选择。"""
     @tf.function
-    def train_step_phys(x_batch, y_batch, eeq_phys_batch, step_counter):
-        # 线性 warmup：从 0 → PHYS_TARGET_LAM
-        lam = tf.cast(PHYS_TARGET_LAM, DTYPE) * tf.minimum(1.0, tf.cast(step_counter, DTYPE)/tf.cast(PHYS_WARMUP_STEPS, DTYPE))
+    def train_step_phys(x_batch, y_batch, eeq_phys_batch, lam_value):
+        lam = tf.cast(lam_value, DTYPE)
 
         with tf.GradientTape() as tape:
             rv = model(x_batch, training=True)
@@ -505,7 +505,7 @@ def make_train_step(model: keras.Model, Y_std_tf: tf.Tensor, Y_mean_tf: tf.Tenso
             J_ref = tf.reduce_sum(tf.square(K_true), axis=-1) / (Eprime + eps)
 
             # 分位数自适应地板：避免极小 J 造成 log/ratio 爆炸
-            j_floor = tfp.stats.percentile(J_ref, q=tf.cast(J_FLOOR_PERCENT, tf.float32))
+            j_floor = tfp.stats.percentile(J_ref, q=tf.cast(J_FLOOR_PERCENT, DTYPE))
             j_floor = tf.maximum(j_floor, eps)
             J_hat_c = tf.maximum(J_hat, j_floor)
             J_ref_c = tf.maximum(J_ref, j_floor)
@@ -539,7 +539,7 @@ def run_training(model: keras.Model, data: dict):
     """训练主循环：构建 Dataset、迭代 epochs，并打印可控日志。"""
     train_step_phys = make_train_step(model, data["Y_std_tf"], data["Y_mean_tf"])
     steps_per_epoch = math.ceil(data["X_norm_tf"].shape[0] / BATCH_SIZE)
-    step_counter = tf.Variable(0, dtype=tf.int64, trainable=False)
+    global_step = 0
 
     for epoch in range(EPOCHS):
         ds = (
@@ -550,8 +550,9 @@ def run_training(model: keras.Model, data: dict):
         )
 
         for step, (xb, yb, eb) in enumerate(ds, start=1):
-            step_counter.assign_add(1)
-            out = train_step_phys(xb, yb, eb, step_counter)
+            global_step += 1
+            current_lam = PHYS_TARGET_LAM * min(1.0, global_step / PHYS_WARMUP_STEPS)
+            out = train_step_phys(xb, yb, eb, current_lam)
             metrics = {
                 "loss": float(out['loss'].numpy()),
                 "nll": float(out['nll'].numpy()),
