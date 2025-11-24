@@ -425,6 +425,15 @@ def load_data_and_prepare(mat_path: str = "matlab_input.mat"):
     )
 
 
+class SVGPModel(keras.Model):
+    def __init__(self, vgp_layer: keras.layers.Layer, **kwargs):
+        super().__init__(**kwargs)
+        self.vgp_layer = vgp_layer
+
+    def call(self, inputs, training=None):
+        return self.vgp_layer(inputs, training=training)
+
+
 def build_model(
     X_norm: np.ndarray, Y_norm: np.ndarray, total_steps: int | None = None
 ):
@@ -455,10 +464,8 @@ def build_model(
         name="SVGPLayer",
     )
 
-    model = keras.Sequential([
-        keras.layers.InputLayer(input_shape=[5], dtype=DTYPE),
-        vgp_layer,
-    ])
+    model = SVGPModel(vgp_layer)
+    _ = model(tf.zeros([1, 5], dtype=DTYPE))  # 预构建变量，便于 summary/save_weights
 
     def negloglik(y_true, rv_pred):
         return -rv_pred.log_prob(y_true)
