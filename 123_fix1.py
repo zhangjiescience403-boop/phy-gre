@@ -500,7 +500,7 @@ def make_train_step(model: keras.Model, Y_std_tf: tf.Tensor, Y_mean_tf: tf.Tenso
         with tf.GradientTape() as tape:
             rv = model(x_batch, training=True)
             nll = -tf.reduce_mean(rv.log_prob(y_batch))
-            kl_raw = tf.reduce_sum(vgp_layer.losses) if vgp_layer.losses else tf.cast(0.0, DTYPE)
+            kl_raw = tf.add_n(vgp_layer.losses)
             kl = kl_scale_tf * kl_raw
 
             # 反标准化到物理量（确保正则作用在真实尺度上）
