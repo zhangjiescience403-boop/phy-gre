@@ -428,7 +428,7 @@ def load_data_and_prepare(mat_path: str = "matlab_input.mat"):
 def build_model(
     X_norm: np.ndarray, Y_norm: np.ndarray, total_steps: int | None = None
 ):
-    """构建 SVGP 模型（convert_to_tensor_fn=mean 以减轻内存）。"""
+    """构建 SVGP 模型（显式返回分布对象，避免依赖 Keras 副作用）。"""
     if total_steps is None:
         batches_per_epoch = math.ceil(X_norm.shape[0] / BATCH_SIZE)
         total_steps = EPOCHS * batches_per_epoch
@@ -451,7 +451,7 @@ def build_model(
         unconstrained_observation_noise_variance_initializer=ki.Constant(np.log(np.expm1(NOISE0))),
         variational_inducing_observations_scale_initializer=ki.Constant(initial_scale),
         jitter=JITTER,
-        convert_to_tensor_fn=lambda d: d.mean(),  # 避免默认 sample 带来的大矩阵 & 随机噪声
+        convert_to_tensor_fn=lambda d: d,  # 返回分布对象，后续显式取 mean/kl
         name="SVGPLayer",
     )
 
@@ -490,13 +490,6 @@ def _dry_run(model: keras.Model, X_norm_tf: tf.Tensor, Y_norm_tf: tf.Tensor):
 
 def make_train_step(model: keras.Model, Y_std_tf: tf.Tensor, Y_mean_tf: tf.Tensor):
     """返回带物理正则的单步训练函数，封装 warmup/地板/ratio 选择。"""
-    vgp_layer = None
-    for layer in model.layers:
-        if isinstance(layer, tfpl.VariationalGaussianProcess) or layer.name == "SVGPLayer":
-            vgp_layer = layer
-            break
-    if vgp_layer is None:
-        raise ValueError("未找到 SVGPLayer；请确保模型包含 VariationalGaussianProcess 层。")
     kl_scale_tf = tf.cast(KL_SCALE, DTYPE)
 
     @tf.function
@@ -506,11 +499,12 @@ def make_train_step(model: keras.Model, Y_std_tf: tf.Tensor, Y_mean_tf: tf.Tenso
         with tf.GradientTape() as tape:
             rv = model(x_batch, training=True)
             nll = -tf.reduce_mean(rv.log_prob(y_batch))
-            kl_raw = tf.add_n(vgp_layer.losses)
+            kl_raw = tf.reduce_sum(rv.surrogate_posterior_kl_divergence_prior())
             kl = kl_scale_tf * kl_raw
 
             # 反标准化到物理量（确保正则作用在真实尺度上）
-            K_pred = rv.mean()*Y_std_tf + Y_mean_tf
+            y_pred_mean = rv.mean()
+            K_pred = y_pred_mean*Y_std_tf + Y_mean_tf
             K_true = y_batch*Y_std_tf + Y_mean_tf
 
             # E'：平面应变（或应力）。若要切换到平面应力，可直接使用 eeq_phys_batch。

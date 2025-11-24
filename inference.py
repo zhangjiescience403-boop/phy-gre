@@ -389,7 +389,7 @@ class ARDRBFKernelLayer(keras.layers.Layer):
 def build_model(
     X_norm: np.ndarray, Y_norm: np.ndarray, total_steps: int | None = None
 ):
-    """构建 SVGP 模型（convert_to_tensor_fn=mean 以减轻内存）。"""
+    """构建 SVGP 模型（显式返回分布对象，避免依赖 Keras 副作用）。"""
     if total_steps is None:
         batches_per_epoch = math.ceil(X_norm.shape[0] / BATCH_SIZE)
         total_steps = EPOCHS * batches_per_epoch
@@ -416,7 +416,7 @@ def build_model(
         unconstrained_observation_noise_variance_initializer=ki.Constant(np.log(np.expm1(NOISE0))),
         variational_inducing_observations_scale_initializer=ki.Constant(initial_scale),
         jitter=JITTER,
-        convert_to_tensor_fn=lambda d: d.mean(),
+        convert_to_tensor_fn=lambda d: d,
         name="SVGPLayer",
     )
 
