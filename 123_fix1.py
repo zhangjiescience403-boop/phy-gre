@@ -490,7 +490,13 @@ def _dry_run(model: keras.Model, X_norm_tf: tf.Tensor, Y_norm_tf: tf.Tensor):
 
 def make_train_step(model: keras.Model, Y_std_tf: tf.Tensor, Y_mean_tf: tf.Tensor):
     """返回带物理正则的单步训练函数，封装 warmup/地板/ratio 选择。"""
-    vgp_layer = model.layers[1]
+    vgp_layer = None
+    for layer in model.layers:
+        if isinstance(layer, tfpl.VariationalGaussianProcess) or layer.name == "SVGPLayer":
+            vgp_layer = layer
+            break
+    if vgp_layer is None:
+        raise ValueError("未找到 SVGPLayer；请确保模型包含 VariationalGaussianProcess 层。")
     kl_scale_tf = tf.cast(KL_SCALE, DTYPE)
 
     @tf.function
