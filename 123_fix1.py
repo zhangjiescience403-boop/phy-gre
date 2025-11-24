@@ -44,7 +44,7 @@ class ShojiNaturalGradient(keras.optimizers.legacy.Optimizer):
         self,
         learning_rate=0.001,
         momentum=0.9,
-        angle_threshold=0.1,
+        angle_threshold=0.5,
         global_clipnorm=None,
         name="ShojiNaturalGradient",
         **kwargs,
@@ -67,7 +67,7 @@ class ShojiNaturalGradient(keras.optimizers.legacy.Optimizer):
         lr = self._decayed_lr(var.dtype)
         beta = tf.cast(self._get_hyper("momentum", var.dtype), var.dtype)
         angle_th = tf.cast(self.angle_threshold, var.dtype)
-        eps_div = tf.cast(1e-12, var.dtype)
+        eps_div = tf.cast(1e-7, var.dtype)
 
         g_prev = self.get_slot(var, "g")
         y = -grad
@@ -113,13 +113,14 @@ tf.keras.backend.set_floatx('float64' if USE_FLOAT64 else 'float32')
 
 # 训练超参
 LEARNING_RATE  = 1e-3
-EPOCHS         = 10
+EPOCHS         = 50
 BATCH_SIZE     = 256
 JITTER         = 1e-4
 NU             = 0.30               # 泊松比
 WARP_DIM       = 2                  # 对 crack_n 开方 warp（0-based 第2列）
 WARP_EPS       = 1e-6
 NOISE0         = 1e-1               # 观测噪声方差初值（softplus 逆会处理）
+KL_SCALE       = 1.0
 
 # 物理正则控制
 PHYS_TARGET_LAM   = 1e-2            # 目标 λ
@@ -433,7 +434,7 @@ def build_model(
         total_steps = EPOCHS * batches_per_epoch
     total_steps = max(1, int(total_steps))
 
-    num_inducing = int(min(100, X_norm.shape[0]))
+    num_inducing = int(min(1000, X_norm.shape[0]))
     D_out        = int(Y_norm.shape[1])
 
     inducing_init = X_norm[np.random.choice(X_norm.shape[0], size=num_inducing, replace=False)]
@@ -471,7 +472,7 @@ def build_model(
     optimizer = ShojiNaturalGradient(
         learning_rate=lr_schedule,
         momentum=0.9,
-        angle_threshold=0.1,
+        angle_threshold=0.5,
         global_clipnorm=1.0,
     )
     model.compile(optimizer=optimizer, loss=negloglik)
@@ -489,15 +490,18 @@ def _dry_run(model: keras.Model, X_norm_tf: tf.Tensor, Y_norm_tf: tf.Tensor):
 
 def make_train_step(model: keras.Model, Y_std_tf: tf.Tensor, Y_mean_tf: tf.Tensor):
     """返回带物理正则的单步训练函数，封装 warmup/地板/ratio 选择。"""
+    vgp_layer = model.layers[1]
+    kl_scale_tf = tf.cast(KL_SCALE, DTYPE)
+
     @tf.function
-    def train_step_phys(x_batch, y_batch, eeq_phys_batch, step_counter):
-        # 线性 warmup：从 0 → PHYS_TARGET_LAM
-        lam = tf.cast(PHYS_TARGET_LAM, DTYPE) * tf.minimum(1.0, tf.cast(step_counter, DTYPE)/tf.cast(PHYS_WARMUP_STEPS, DTYPE))
+    def train_step_phys(x_batch, y_batch, eeq_phys_batch, lam_var):
+        lam = tf.cast(lam_var, DTYPE)
 
         with tf.GradientTape() as tape:
             rv = model(x_batch, training=True)
             nll = -tf.reduce_mean(rv.log_prob(y_batch))
-            kl  = tf.add_n(model.losses) if model.losses else tf.cast(0.0, DTYPE)
+            kl_raw = tf.reduce_sum(vgp_layer.losses) if vgp_layer.losses else tf.cast(0.0, DTYPE)
+            kl = kl_scale_tf * kl_raw
 
             # 反标准化到物理量（确保正则作用在真实尺度上）
             K_pred = rv.mean()*Y_std_tf + Y_mean_tf
@@ -547,6 +551,7 @@ def run_training(model: keras.Model, data: dict):
     train_step_phys = make_train_step(model, data["Y_std_tf"], data["Y_mean_tf"])
     steps_per_epoch = math.ceil(data["X_norm_tf"].shape[0] / BATCH_SIZE)
     step_counter = tf.Variable(0, dtype=tf.int64, trainable=False)
+    lam_var = tf.Variable(0.0, dtype=DTYPE, trainable=False)
 
     for epoch in range(EPOCHS):
         ds = (
@@ -558,7 +563,12 @@ def run_training(model: keras.Model, data: dict):
 
         for step, (xb, yb, eb) in enumerate(ds, start=1):
             step_counter.assign_add(1)
-            out = train_step_phys(xb, yb, eb, step_counter)
+            lam_value = tf.cast(PHYS_TARGET_LAM, DTYPE) * tf.minimum(
+                tf.cast(1.0, DTYPE),
+                tf.cast(step_counter, DTYPE) / tf.cast(PHYS_WARMUP_STEPS, DTYPE),
+            )
+            lam_var.assign(lam_value)
+            out = train_step_phys(xb, yb, eb, lam_var)
             metrics = {
                 "loss": float(out['loss'].numpy()),
                 "nll": float(out['nll'].numpy()),
