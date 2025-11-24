@@ -395,6 +395,20 @@ class SVGPModel(keras.Model):
         return self.vgp_layer(inputs, training=training)
 
 
+def _identity_with_shape(dist: tfp.distributions.Distribution):
+    """Return distribution itself while supplying a TensorShape for TFP layer checks.
+
+    TFP 0.23 inspects `value.shape` inside DistributionLambda even when we return a
+    Distribution via `convert_to_tensor_fn`. Attaching a TensorShape derived from
+    batch/event shapes bypasses the attribute error without touching sampling or
+    gradients.
+    """
+
+    if not hasattr(dist, "shape"):
+        dist.shape = dist.batch_shape.concatenate(dist.event_shape)
+    return dist
+
+
 def build_model(
     X_norm: np.ndarray, Y_norm: np.ndarray, total_steps: int | None = None
 ):
@@ -425,7 +439,7 @@ def build_model(
         unconstrained_observation_noise_variance_initializer=ki.Constant(np.log(np.expm1(NOISE0))),
         variational_inducing_observations_scale_initializer=ki.Constant(initial_scale),
         jitter=JITTER,
-        convert_to_tensor_fn=lambda d: d,
+        convert_to_tensor_fn=_identity_with_shape,
         name="SVGPLayer",
     )
 

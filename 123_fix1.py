@@ -434,6 +434,23 @@ class SVGPModel(keras.Model):
         return self.vgp_layer(inputs, training=training)
 
 
+def _identity_with_shape(dist: tfp.distributions.Distribution):
+    """Return distribution itself while supplying a TensorShape for TFP layer checks.
+
+    TFP 0.23's DistributionLambda/VariationalGaussianProcess inspects `value.shape`
+    even when `convert_to_tensor_fn` returns a Distribution. A bare Distribution
+    lacks `.shape`, so we attach one derived from batch+event shapes to bypass the
+    check without sampling or altering gradients.
+    """
+
+    if not hasattr(dist, "shape"):
+        # Best-effort TensorShape; can include None for unknown dims but satisfies
+        # the attribute access used by distribution_layer.py. This is pure-Python
+        # metadata and does not touch graph ops or gradients.
+        dist.shape = dist.batch_shape.concatenate(dist.event_shape)
+    return dist
+
+
 def build_model(
     X_norm: np.ndarray, Y_norm: np.ndarray, total_steps: int | None = None
 ):
@@ -460,7 +477,7 @@ def build_model(
         unconstrained_observation_noise_variance_initializer=ki.Constant(np.log(np.expm1(NOISE0))),
         variational_inducing_observations_scale_initializer=ki.Constant(initial_scale),
         jitter=JITTER,
-        convert_to_tensor_fn=lambda d: d,  # 返回分布对象，后续显式取 mean/kl
+        convert_to_tensor_fn=_identity_with_shape,  # 返回分布对象并附加 shape 元数据
         name="SVGPLayer",
     )
 
