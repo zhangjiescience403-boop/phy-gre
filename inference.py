@@ -394,101 +394,61 @@ def preprocess_window_eq(X_np: np.ndarray, m=20, delta_ratio=0.2):
 
 # -----------------------------------------------------------------------------
 
-def validate_and_prepare(X_raw: np.ndarray, Y_raw: np.ndarray):
-
+def validate_and_prepare(
+    X_raw: np.ndarray, Y_raw: np.ndarray | None, stats: dict | None = None
+):
     """输入校验 + warp + 标准化。
 
-    先对 crack_n 开方，并将角度拆解为正弦/余弦，再对展开后的特征做 z-score。"""
-
-    if not isinstance(X_raw, np.ndarray) or not isinstance(Y_raw, np.ndarray):
-
-        raise TypeError("X_raw/Y_raw 必须是 numpy.ndarray")
-
-
+    先对 crack_n 开方，并将角度拆解为正弦/余弦，再对展开后的特征做 z-score。
+    当 ``stats`` 提供时，使用训练集的均值/方差进行归一化，避免推理时的数据泄漏。
+    """
+    if not isinstance(X_raw, np.ndarray):
+        raise TypeError("X_raw 必须是 numpy.ndarray")
+    if Y_raw is not None and not isinstance(Y_raw, np.ndarray):
+        raise TypeError("Y_raw 必须是 numpy.ndarray 或 None")
 
     if X_raw.ndim != 2 or X_raw.shape[1] != 5:
-
         raise ValueError(f"X 形状应为 (N,5)，当前 {X_raw.shape}")
 
-
-
-    if Y_raw.ndim == 1:
-
-        Y_raw = Y_raw.reshape(-1, 1)
-
-    elif Y_raw.ndim == 2 and Y_raw.shape[0] == 1 and Y_raw.shape[1] > 1:
-
-        Y_raw = Y_raw.T
-
-    if Y_raw.ndim != 2:
-
-        raise ValueError(f"Y 形状应为二维 (N,C)，当前 {Y_raw.shape}")
-
-
+    if Y_raw is not None:
+        if Y_raw.ndim == 1:
+            Y_raw = Y_raw.reshape(-1, 1)
+        elif Y_raw.ndim == 2 and Y_raw.shape[0] == 1 and Y_raw.shape[1] > 1:
+            Y_raw = Y_raw.T
+        if Y_raw.ndim != 2:
+            raise ValueError(f"Y 形状应为二维 (N,C)，当前 {Y_raw.shape}")
 
     X_finite = np.all(np.isfinite(X_raw), axis=1)
-
-    Y_finite = np.all(np.isfinite(Y_raw), axis=1)
-
+    Y_finite = np.ones_like(X_finite, dtype=bool) if Y_raw is None else np.all(np.isfinite(Y_raw), axis=1)
     keep_mask = X_finite & Y_finite
-
     if not keep_mask.all():
-
         bad = np.where(~keep_mask)[0]
-
         print(f"警告：移除含 NaN/Inf 样本 {bad.shape[0]} 行，示例索引: {bad[:10]}")
-
     Xc = X_raw[keep_mask].astype(np.float64)
-
-    Yc = Y_raw[keep_mask].astype(np.float64)
-
-
+    Yc = None if Y_raw is None else Y_raw[keep_mask].astype(np.float64)
 
     Ro = Xc[:, 0]
-
     Rn = Xc[:, 1]
-
     crack_n = Xc[:, 2]
-
     if np.any(Ro <= 0):
-
         bad = np.where(Ro <= 0)[0]
-
         raise ValueError(f"存在 Ro<=0，样本行: {bad[:10]} ...")
-
     if np.any((Rn <= 0) | (Rn >= 1)):
-
         bad = np.where((Rn <= 0) | (Rn >= 1))[0]
-
         raise ValueError(f"R_n 必须在 (0,1)，样本行: {bad[:10]} ...")
-
     if np.any((crack_n <= 0) | (crack_n >= 1)):
-
         bad = np.where((crack_n <= 0) | (crack_n >= 1))[0]
-
         raise ValueError(f"crack_n 必须在 (0,1)，样本行: {bad[:10]} ...")
 
-
-
     Ri = Rn * Ro
-
     Dp = Ro - Ri
-
     a = crack_n * Dp
-
     if np.any(Dp <= 0):
-
         bad = np.where(Dp <= 0)[0]
-
         raise ValueError(f"存在 Dp<=0（壁厚非正），样本行: {bad[:10]} ...")
-
     if np.any((a <= 0) | (a >= Dp)):
-
         bad = np.where((a <= 0) | (a >= Dp))[0]
-
         raise ValueError(f"a 不在 (0,Dp)，样本行: {bad[:10]} ...")
-
-
 
     theta_deg = Xc[:, 3]
     theta_rad = np.deg2rad(theta_deg)
@@ -497,70 +457,51 @@ def validate_and_prepare(X_raw: np.ndarray, Y_raw: np.ndarray):
     sin_theta = np.sin(theta_rad)
     cos_theta = np.cos(theta_rad)
 
-    X_expanded = np.column_stack(
-        [Ro, Rn, crack_n_warp, sin_theta, cos_theta, Xc[:, 4]]
-    )
+    X_expanded = np.column_stack([Ro, Rn, crack_n_warp, sin_theta, cos_theta, Xc[:, 4]])
 
-    X_mean = X_expanded.mean(axis=0)
-
-    X_std = X_expanded.std(axis=0)
-
-    X_std[X_std == 0] = 1.0
-
+    if stats is None:
+        X_mean = X_expanded.mean(axis=0)
+        X_std = X_expanded.std(axis=0)
+        X_std[X_std == 0] = 1.0
+    else:
+        X_mean = np.asarray(stats["X_mean"], dtype=np.float64)
+        X_std = np.asarray(stats["X_std"], dtype=np.float64)
     X_norm = (X_expanded - X_mean) / X_std
 
+    if Yc is not None:
+        if stats is None:
+            Y_mean = Yc.mean(axis=0)
+            Y_std = Yc.std(axis=0)
+            Y_std[Y_std == 0] = 1.0
+        else:
+            Y_mean = np.asarray(stats["Y_mean"], dtype=np.float64)
+            Y_std = np.asarray(stats["Y_std"], dtype=np.float64)
+        Y_norm = (Yc - Y_mean) / Y_std
+    else:
+        Y_mean = None if stats is None else np.asarray(stats.get("Y_mean"), dtype=np.float64)
+        Y_std = None if stats is None else np.asarray(stats.get("Y_std"), dtype=np.float64)
+        Y_norm = None
 
-
-    Y_mean = Yc.mean(axis=0)
-
-    Y_std = Yc.std(axis=0)
-
-    Y_std[Y_std == 0] = 1.0
-
-    Y_norm = (Yc - Y_mean) / Y_std
-
-
-
-    if X_norm.shape[0] != Y_norm.shape[0]:
-
-        raise ValueError(f"X/Y 样本数不一致：{X_norm.shape[0]} vs {Y_norm.shape[0]}")
-
+    if Y_norm is not None:
+        if X_norm.shape[0] != Y_norm.shape[0]:
+            raise ValueError(f"X/Y 样本数不一致：{X_norm.shape[0]} vs {Y_norm.shape[0]}")
+        if not np.isfinite(Y_norm).all():
+            bad = np.argwhere(~np.isfinite(Y_norm))[:5]
+            raise ValueError(f"Y_norm 含非有限值，位置示例: {bad}")
     if not np.isfinite(X_norm).all():
-
         bad = np.argwhere(~np.isfinite(X_norm))[:5]
-
         raise ValueError(f"X_norm 含非有限值，位置示例: {bad}")
 
-    if not np.isfinite(Y_norm).all():
-
-        bad = np.argwhere(~np.isfinite(Y_norm))[:5]
-
-        raise ValueError(f"Y_norm 含非有限值，位置示例: {bad}")
-
-
-
     return (
-
         X_expanded.astype(np.float32),
-
         X_norm.astype(np.float32),
-
         X_mean.astype(np.float32),
-
         X_std.astype(np.float32),
-
-        Y_norm.astype(np.float32),
-
-        Y_mean.astype(np.float32),
-
-        Y_std.astype(np.float32),
-
+        None if Y_norm is None else Y_norm.astype(np.float32),
+        None if Y_mean is None else Y_mean.astype(np.float32),
+        None if Y_std is None else Y_std.astype(np.float32),
         keep_mask,
-
     )
-
-
-
 
 
 def _self_check(X_np_raw: np.ndarray, keep_mask_np: np.ndarray, X_norm_tf: tf.Tensor, X_mean: np.ndarray, X_std: np.ndarray):
@@ -614,13 +555,10 @@ def _self_check(X_np_raw: np.ndarray, keep_mask_np: np.ndarray, X_norm_tf: tf.Te
 
 
 def load_data_and_prepare(mat_path: str = "matlab_input.mat"):
-
     """读取 .mat -> 几何验证 -> 物理量计算 -> Tensor 化。"""
 
     mat = sio.loadmat(mat_path)
-
     X_np_raw = mat["data_input"]
-
     Y_np_raw = mat["combinedData"]
 
 
@@ -654,23 +592,14 @@ def load_data_and_prepare(mat_path: str = "matlab_input.mat"):
 
 
     (
-
         X_warp_raw,
-
         X_norm,
-
         X_mean,
-
         X_std,
-
         Y_norm,
-
         Y_mean,
-
         Y_std,
-
         keep_mask_np,
-
     ) = validate_and_prepare(X_np_raw, Y_np_raw)
 
 
@@ -696,25 +625,21 @@ def load_data_and_prepare(mat_path: str = "matlab_input.mat"):
 
 
     return dict(
-
+        X_raw=X_np_raw[keep_mask_np],
+        X_warp_raw=X_warp_raw,
         X_norm=X_norm,
-
         Y_norm=Y_norm,
-
         X_norm_tf=X_norm_tf,
-
         Y_norm_tf=Y_norm_tf,
-
         Eeq_tf=Eeq_tf,
-
         Y_mean_tf=Y_mean_tf,
-
         Y_std_tf=Y_std_tf,
-
         keep_mask=keep_mask_np,
-
         aux=aux,
-
+        X_mean=X_mean,
+        X_std=X_std,
+        Y_mean=Y_mean,
+        Y_std=Y_std,
     )
 
 
@@ -998,57 +923,54 @@ def predict_mean_batched(model, X_tf: tf.Tensor, batch_size: int = 8192):
     return np.vstack(means)
 
 
-
-
-
 # -----------------------------------------------------------------------------
 
 # Inference logic
 
 # -----------------------------------------------------------------------------
 
-def load_and_predict(weights_path: str, X_new: np.ndarray, template_data: dict | None = None):
+def load_and_predict(
+    weights_path: str,
+    X_new_raw: np.ndarray,
+    train_stats: dict,
+    template_data: dict | None = None,
+):
+    """Rebuild the SVGP model, load weights, and predict on raw ``X_new_raw``.
 
-    """Rebuild the SVGP model, load weights, and predict on ``X_new``.
-
-
+    The raw features (5 columns) are warped and normalized using training statistics so
+    they align with the model's 6-D feature space and z-score scaling.
 
     Parameters
-
     ----------
-
     weights_path: str
-
         Path to the ``.h5`` weights saved by ``model.save_weights``.
-
-    X_new: np.ndarray
-
-        Normalized input array (shape ``[N, 5]``) in the same format used for training.
-
+    X_new_raw: np.ndarray
+        Raw input array (shape ``[N, 5]``) prior to crack_n sqrt + sin/cos expansion.
+    train_stats: dict
+        Dictionary containing ``X_mean``, ``X_std``, ``Y_mean``, and ``Y_std`` from training.
     template_data: dict | None
-
         Optional pre-loaded data from :func:`load_data_and_prepare` to reuse shapes.
-
     """
-
     if template_data is None:
-
         template_data = load_data_and_prepare()
 
-
+    (
+        _,
+        X_norm_new,
+        _,
+        _,
+        _,
+        _,
+        _,
+        _,
+    ) = validate_and_prepare(X_new_raw, None, stats=train_stats)
 
     total_steps = max(1, EPOCHS * math.ceil(template_data["X_norm"].shape[0] / BATCH_SIZE))
-
     model = build_model(template_data["X_norm"], template_data["Y_norm"], total_steps)
-
     model.load_weights(weights_path)
 
-
-
-    X_tf = tf.convert_to_tensor(X_new, dtype=DTYPE)
-
+    X_tf = tf.convert_to_tensor(X_norm_new, dtype=DTYPE)
     preds_norm = predict_mean_batched(model, X_tf)
-
     return preds_norm
 
 
@@ -1062,21 +984,23 @@ def load_and_predict(weights_path: str, X_new: np.ndarray, template_data: dict |
 # -----------------------------------------------------------------------------
 
 if __name__ == "__main__":
-
     data = load_data_and_prepare()
-
     weights_file = "svgp_shoji_weights.h5"
 
+    train_stats = dict(
+        X_mean=data["X_mean"],
+        X_std=data["X_std"],
+        Y_mean=data["Y_mean"],
+        Y_std=data["Y_std"],
+    )
 
+    preds_norm = load_and_predict(
+        weights_file, data["X_raw"], train_stats=train_stats, template_data=data
+    )
 
-    preds_norm = load_and_predict(weights_file, data["X_norm"], template_data=data)
-
-
-
-    preds_physical = preds_norm * data["Y_std_tf"].numpy() + data["Y_mean_tf"].numpy()
+    preds_physical = preds_norm * train_stats["Y_std"] + train_stats["Y_mean"]
 
     print("Predictive mean (first 10 rows, physical scale):")
-
     print(preds_physical[:10])
 
 import pandas as pd
