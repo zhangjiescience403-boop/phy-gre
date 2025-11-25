@@ -234,8 +234,8 @@ def validate_and_prepare(X_raw: np.ndarray, Y_raw: np.ndarray):
     该函数确保：
     1. X/Y 形状合理且均为有限值；
     2. 几何/物理约束满足常识（半径与裂纹比例均在 (0,1)）；
-    3. 先对 crack_n 做开方 warp，再对全部特征和标签做 z-score 标准化。
-    返回 warp 后未标准化的 X（便于物理量计算）与标准化后的 X/Y 及对应均值、方差。
+    3. 对 crack_n 开方，角度展开为正弦/余弦后再做 z-score 标准化。
+    返回展开后的 X（未标准化）、标准化后的 X/Y 及对应均值、方差。
     """
     if not isinstance(X_raw, np.ndarray) or not isinstance(Y_raw, np.ndarray):
         raise TypeError("X_raw/Y_raw 必须是 numpy.ndarray")
@@ -287,15 +287,26 @@ def validate_and_prepare(X_raw: np.ndarray, Y_raw: np.ndarray):
         bad = np.where((a <= 0) | (a >= Dp))[0];
         raise ValueError(f"a 不在 (0,Dp)，样本行: {bad[:10]} ...")
 
-    # pre-warp crack_n：对裂纹比例开方，缓解极小值导致的梯度尖锐
-    X_warp = Xc.copy()
-    X_warp[:, WARP_DIM] = np.sqrt(np.maximum(0.0, X_warp[:, WARP_DIM]) + WARP_EPS)
+    # 按列拆分特征，显式转换角度
+    theta_deg = Xc[:, 3]
+    theta_rad = np.deg2rad(theta_deg)
 
-    # z-score（针对 warp 后数据）：避免零方差造成除零
-    X_mean = X_warp.mean(axis=0)
-    X_std = X_warp.std(axis=0)
+    # pre-warp crack_n：对裂纹比例开方，缓解极小值导致的梯度尖锐
+    crack_n_warp = np.sqrt(np.maximum(0.0, crack_n) + WARP_EPS)
+
+    sin_theta = np.sin(theta_rad)
+    cos_theta = np.cos(theta_rad)
+
+    # 重新组装 6 维输入：[Ro, Rn, sqrt(crack_n), sin_theta, cos_theta, FGM_n]
+    X_expanded = np.column_stack(
+        [Ro, Rn, crack_n_warp, sin_theta, cos_theta, Xc[:, 4]]
+    )
+
+    # z-score（针对展开后数据）：避免零方差造成除零
+    X_mean = X_expanded.mean(axis=0)
+    X_std = X_expanded.std(axis=0)
     X_std[X_std == 0] = 1.0
-    X_norm = (X_warp - X_mean) / X_std
+    X_norm = (X_expanded - X_mean) / X_std
 
     # Y 标准化
     Y_mean = Yc.mean(axis=0)
@@ -314,7 +325,7 @@ def validate_and_prepare(X_raw: np.ndarray, Y_raw: np.ndarray):
         raise ValueError(f"Y_norm 含非有限值，位置示例: {bad}")
 
     return (
-        X_warp.astype(np.float32),
+        X_expanded.astype(np.float32),
         X_norm.astype(np.float32), X_mean.astype(np.float32), X_std.astype(np.float32),
         Y_norm.astype(np.float32), Y_mean.astype(np.float32), Y_std.astype(np.float32),
         keep_mask,
@@ -329,6 +340,11 @@ class ARDRBFKernelLayer(keras.layers.Layer):
         super().__init__(**kwargs)
         if length_scale_diag is None:
             length_scale_diag = np.ones([input_dim], np.float32)
+        length_scale_diag = np.asarray(length_scale_diag, dtype=np.float32)
+        if length_scale_diag.shape[0] != input_dim:
+            raise ValueError(
+                f"length_scale_diag shape {length_scale_diag.shape} 与 input_dim={input_dim} 不一致"
+            )
         self._amp_unconstrained = self.add_weight(
             name="amplitude", shape=[],
             initializer=ki.Constant(np.log(np.expm1(amplitude))),
@@ -372,13 +388,21 @@ def _self_check(X_np_raw: np.ndarray, keep_mask_np: np.ndarray, X_norm_tf: tf.Te
     _e_toy, _ = preprocess_window_eq(Xtoy, m=20, delta_ratio=0.2)
     assert _e_toy.shape == (2,) and np.all(_e_toy > 0)
 
-    # warp 一致性检查：除 warp 维度外保持一致
+    # warp 与展开一致性检查
     _tmp = X_np_raw[keep_mask_np].astype(np.float64)
-    _tmp_w = _tmp.copy();
-    _tmp_w[:, WARP_DIM] = np.sqrt(np.maximum(0.0, _tmp_w[:, WARP_DIM]) + WARP_EPS)
-    _mask_other = np.ones(5, dtype=bool);
-    _mask_other[WARP_DIM] = False
-    assert np.allclose(_tmp[:, _mask_other], _tmp_w[:, _mask_other])
+    _theta_rad = np.deg2rad(_tmp[:, 3])
+    _tmp_warp = np.column_stack(
+        [
+            _tmp[:, 0],
+            _tmp[:, 1],
+            np.sqrt(np.maximum(0.0, _tmp[:, WARP_DIM]) + WARP_EPS),
+            np.sin(_theta_rad),
+            np.cos(_theta_rad),
+            _tmp[:, 4],
+        ]
+    )
+    assert np.allclose(_tmp_warp[:, :2], _tmp[:, :2])
+    assert np.all((_tmp_warp[:, 3:5] >= -1.0) & (_tmp_warp[:, 3:5] <= 1.0)).all()
 
     # 标准化后应为零均值（数值误差允许 1e-6）
     _norm_mean = tf.reduce_mean(X_norm_tf, axis=0).numpy()
@@ -496,7 +520,11 @@ def build_model(
 
     vgp_layer = tfpl.VariationalGaussianProcess(
         num_inducing_points=num_inducing,
-        kernel_provider=ARDRBFKernelLayer(amplitude=0.5, length_scale_diag=np.ones(5, np.float32) * 0.1, input_dim=5),
+        kernel_provider=ARDRBFKernelLayer(
+            amplitude=0.5,
+            length_scale_diag=np.array([2.0, 0.5, 0.5, 0.1, 0.1, 2.0], np.float32),
+            input_dim=6,
+        ),
         event_shape=(D_out,),
         inducing_index_points_initializer=ki.Constant(inducing_init_multi),
         unconstrained_observation_noise_variance_initializer=ki.Constant(np.log(np.expm1(NOISE0))),
@@ -509,7 +537,7 @@ def build_model(
 
 
     model = SVGPModel(vgp_layer)
-    _ = model(tf.zeros([1, 5], dtype=DTYPE))  # 预构建变量，便于 summary/save_weights
+    _ = model(tf.zeros([1, 6], dtype=DTYPE))  # 预构建变量，便于 summary/save_weights
 
     def negloglik(y_true, rv_pred):
         return -rv_pred.log_prob(y_true)

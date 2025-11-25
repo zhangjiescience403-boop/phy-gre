@@ -396,7 +396,9 @@ def preprocess_window_eq(X_np: np.ndarray, m=20, delta_ratio=0.2):
 
 def validate_and_prepare(X_raw: np.ndarray, Y_raw: np.ndarray):
 
-    """输入校验 + warp + 标准化。"""
+    """输入校验 + warp + 标准化。
+
+    先对 crack_n 开方，并将角度拆解为正弦/余弦，再对展开后的特征做 z-score。"""
 
     if not isinstance(X_raw, np.ndarray) or not isinstance(Y_raw, np.ndarray):
 
@@ -488,19 +490,24 @@ def validate_and_prepare(X_raw: np.ndarray, Y_raw: np.ndarray):
 
 
 
-    X_warp = Xc.copy()
+    theta_deg = Xc[:, 3]
+    theta_rad = np.deg2rad(theta_deg)
 
-    X_warp[:, WARP_DIM] = np.sqrt(np.maximum(0.0, X_warp[:, WARP_DIM]) + WARP_EPS)
+    crack_n_warp = np.sqrt(np.maximum(0.0, crack_n) + WARP_EPS)
+    sin_theta = np.sin(theta_rad)
+    cos_theta = np.cos(theta_rad)
 
+    X_expanded = np.column_stack(
+        [Ro, Rn, crack_n_warp, sin_theta, cos_theta, Xc[:, 4]]
+    )
 
+    X_mean = X_expanded.mean(axis=0)
 
-    X_mean = X_warp.mean(axis=0)
-
-    X_std = X_warp.std(axis=0)
+    X_std = X_expanded.std(axis=0)
 
     X_std[X_std == 0] = 1.0
 
-    X_norm = (X_warp - X_mean) / X_std
+    X_norm = (X_expanded - X_mean) / X_std
 
 
 
@@ -534,7 +541,7 @@ def validate_and_prepare(X_raw: np.ndarray, Y_raw: np.ndarray):
 
     return (
 
-        X_warp.astype(np.float32),
+        X_expanded.astype(np.float32),
 
         X_norm.astype(np.float32),
 
@@ -570,15 +577,31 @@ def _self_check(X_np_raw: np.ndarray, keep_mask_np: np.ndarray, X_norm_tf: tf.Te
 
     _tmp = X_np_raw[keep_mask_np].astype(np.float64)
 
-    _tmp_w = _tmp.copy()
+    _theta_rad = np.deg2rad(_tmp[:, 3])
 
-    _tmp_w[:, WARP_DIM] = np.sqrt(np.maximum(0.0, _tmp_w[:, WARP_DIM]) + WARP_EPS)
+    _tmp_warp = np.column_stack(
 
-    _mask_other = np.ones(5, dtype=bool)
+        [
 
-    _mask_other[WARP_DIM] = False
+            _tmp[:, 0],
 
-    assert np.allclose(_tmp[:, _mask_other], _tmp_w[:, _mask_other])
+            _tmp[:, 1],
+
+            np.sqrt(np.maximum(0.0, _tmp[:, WARP_DIM]) + WARP_EPS),
+
+            np.sin(_theta_rad),
+
+            np.cos(_theta_rad),
+
+            _tmp[:, 4],
+
+        ]
+
+    )
+
+    assert np.allclose(_tmp_warp[:, :2], _tmp[:, :2])
+
+    assert np.all((_tmp_warp[:, 3:5] >= -1.0) & (_tmp_warp[:, 3:5] <= 1.0)).all()
 
 
 
@@ -713,6 +736,16 @@ class ARDRBFKernelLayer(keras.layers.Layer):
         if length_scale_diag is None:
 
             length_scale_diag = np.ones([input_dim], np.float32)
+
+        length_scale_diag = np.asarray(length_scale_diag, dtype=np.float32)
+
+        if length_scale_diag.shape[0] != input_dim:
+
+            raise ValueError(
+
+                f"length_scale_diag shape {length_scale_diag.shape} 与 input_dim={input_dim} 不一致"
+
+            )
 
         self._amp_unconstrained = self.add_weight(
 
@@ -874,7 +907,11 @@ def build_model(
 
         kernel_provider=ARDRBFKernelLayer(
 
-            amplitude=0.5, length_scale_diag=np.ones(5, np.float32), input_dim=5
+            amplitude=0.5,
+
+            length_scale_diag=np.array([2.0, 0.5, 0.5, 0.1, 0.1, 2.0], np.float32),
+
+            input_dim=6,
 
         ),
 
@@ -898,7 +935,7 @@ def build_model(
 
     model = SVGPModel(vgp_layer)
 
-    _ = model(tf.zeros([1, 5], dtype=DTYPE))  # 预构建变量，便于 summary/save_weights
+    _ = model(tf.zeros([1, 6], dtype=DTYPE))  # 预构建变量，便于 summary/save_weights
 
 
 
