@@ -194,7 +194,7 @@ class ShojiNaturalGradient(keras.optimizers.legacy.Optimizer):
 
 # -----------------------------------------------------------------------------
 
-USE_FLOAT64 = False
+USE_FLOAT64 = True
 
 DTYPE = tf.float64 if USE_FLOAT64 else tf.float32
 
@@ -212,7 +212,7 @@ EPOCHS = 10
 
 BATCH_SIZE = 256
 
-JITTER = 1e-4
+JITTER = 1e-3
 
 NU = 0.30
 
@@ -930,27 +930,18 @@ def predict_mean_batched(model, X_tf: tf.Tensor, batch_size: int = 8192):
 # -----------------------------------------------------------------------------
 
 def load_and_predict(
-    weights_path: str,
+    weights_paths: tuple[str, str],
     X_new_raw: np.ndarray,
     train_stats: dict,
     template_data: dict | None = None,
 ):
-    """Rebuild the SVGP model, load weights, and predict on raw ``X_new_raw``.
+    """Rebuild two single-output SVGP models and predict on ``X_new_raw``.
 
-    The raw features (5 columns) are warped and normalized using training statistics so
-    they align with the model's 6-D feature space and z-score scaling.
-
-    Parameters
-    ----------
-    weights_path: str
-        Path to the ``.h5`` weights saved by ``model.save_weights``.
-    X_new_raw: np.ndarray
-        Raw input array (shape ``[N, 5]``) prior to crack_n sqrt + sin/cos expansion.
-    train_stats: dict
-        Dictionary containing ``X_mean``, ``X_std``, ``Y_mean``, and ``Y_std`` from training.
-    template_data: dict | None
-        Optional pre-loaded data from :func:`load_data_and_prepare` to reuse shapes.
+    The raw features (5 columns) are warped/normalized using training statistics.
+    Each column-specific model is loaded separately, predictions are denormalized
+    with the matching mean/std, and concatenated into a ``[N, 2]`` array.
     """
+
     if template_data is None:
         template_data = load_data_and_prepare()
 
@@ -966,12 +957,20 @@ def load_and_predict(
     ) = validate_and_prepare(X_new_raw, None, stats=train_stats)
 
     total_steps = max(1, EPOCHS * math.ceil(template_data["X_norm"].shape[0] / BATCH_SIZE))
-    model = build_model(template_data["X_norm"], template_data["Y_norm"], total_steps)
-    model.load_weights(weights_path)
-
     X_tf = tf.convert_to_tensor(X_norm_new, dtype=DTYPE)
-    preds_norm = predict_mean_batched(model, X_tf)
-    return preds_norm
+
+    preds_phys = []
+    for idx, weight_path in enumerate(weights_paths):
+        y_norm_template = template_data["Y_norm"][:, idx : idx + 1]
+        model = build_model(template_data["X_norm"], y_norm_template, total_steps)
+        model.load_weights(weight_path)
+
+        preds_norm_col = predict_mean_batched(model, X_tf)
+        mean_col = np.asarray(train_stats["Y_mean"], dtype=np.float64)[idx : idx + 1]
+        std_col = np.asarray(train_stats["Y_std"], dtype=np.float64)[idx : idx + 1]
+        preds_phys.append(preds_norm_col * std_col + mean_col)
+
+    return np.hstack(preds_phys)
 
 
 
@@ -985,7 +984,7 @@ def load_and_predict(
 
 if __name__ == "__main__":
     data = load_data_and_prepare()
-    weights_file = "svgp_shoji_weights.h5"
+    weight_files = ("svgp_col0.h5", "svgp_col1.h5")
 
     train_stats = dict(
         X_mean=data["X_mean"],
@@ -994,11 +993,9 @@ if __name__ == "__main__":
         Y_std=data["Y_std"],
     )
 
-    preds_norm = load_and_predict(
-        weights_file, data["X_raw"], train_stats=train_stats, template_data=data
+    preds_physical = load_and_predict(
+        weight_files, data["X_raw"], train_stats=train_stats, template_data=data
     )
-
-    preds_physical = preds_norm * train_stats["Y_std"] + train_stats["Y_mean"]
 
     print("Predictive mean (first 10 rows, physical scale):")
     print(preds_physical[:10])

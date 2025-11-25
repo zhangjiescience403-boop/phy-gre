@@ -109,7 +109,7 @@ class ShojiNaturalGradient(keras.optimizers.legacy.Optimizer):
 # ------------------------------------------------------------
 # 可调参数
 # ------------------------------------------------------------
-USE_FLOAT64 = False  # 如需更稳可设 True（并把 JITTER 降到 1e-5 左右）
+USE_FLOAT64 = True  # 使用 float64 保持数值稳定
 DTYPE = tf.float64 if USE_FLOAT64 else tf.float32
 np.random.seed(42);
 tf.random.set_seed(42)
@@ -119,7 +119,7 @@ tf.keras.backend.set_floatx('float64' if USE_FLOAT64 else 'float32')
 LEARNING_RATE = 1e-3
 EPOCHS = 200
 BATCH_SIZE = 256
-JITTER = 1e-4
+JITTER = 1e-3
 NU = 0.30  # 泊松比
 WARP_DIM = 2  # 对 crack_n 开方 warp（0-based 第2列）
 WARP_EPS = 1e-6
@@ -466,6 +466,12 @@ def load_data_and_prepare(mat_path: str = "matlab_input.mat"):
         Y_std_tf=Y_std_tf,
         keep_mask=keep_mask_np,
         aux=aux,
+        X_mean=X_mean,
+        X_std=X_std,
+        Y_mean=Y_mean,
+        Y_std=Y_std,
+        X_raw=X_np_raw[keep_mask_np],
+        Y_raw=Y_np_raw[keep_mask_np],
     )
 
 
@@ -625,7 +631,23 @@ def make_train_step(model: keras.Model, Y_std_tf: tf.Tensor, Y_mean_tf: tf.Tenso
     return train_step_phys
 
 
-def run_training(model: keras.Model, data: dict):
+def _slice_data_for_column(data: dict, col_idx: int) -> dict:
+    """Prepare a per-column view of the dataset for single-output training."""
+
+    y_norm_slice = data["Y_norm"][:, col_idx : col_idx + 1]
+    y_mean_slice = data["Y_mean"][col_idx : col_idx + 1]
+    y_std_slice = data["Y_std"][col_idx : col_idx + 1]
+
+    return {
+        **data,
+        "Y_norm": y_norm_slice,
+        "Y_norm_tf": tf.convert_to_tensor(y_norm_slice, dtype=DTYPE),
+        "Y_mean_tf": tf.convert_to_tensor(y_mean_slice, dtype=DTYPE),
+        "Y_std_tf": tf.convert_to_tensor(y_std_slice, dtype=DTYPE),
+    }
+
+
+def run_training(model: keras.Model, data: dict, save_name: str):
     """训练主循环：构建 Dataset、迭代 epochs，并打印可控日志。"""
     train_step_phys = make_train_step(model, data["Y_std_tf"], data["Y_mean_tf"])
     steps_per_epoch = math.ceil(data["X_norm_tf"].shape[0] / BATCH_SIZE)
@@ -674,17 +696,19 @@ def run_training(model: keras.Model, data: dict):
 
         print(f"epoch {epoch + 1} done")
 
+    model.save_weights(save_name)
+    print(f"\n[System] Model weights saved to: {save_name}")
+
 
 def main():
     data = load_data_and_prepare()
     total_steps = EPOCHS * math.ceil(data["X_norm"].shape[0] / BATCH_SIZE)
-    model = build_model(data["X_norm"], data["Y_norm"], total_steps)
-    _dry_run(model, data["X_norm_tf"], data["Y_norm_tf"])
-    run_training(model, data)
 
-    save_path = "svgp_shoji_weights.h5"
-    model.save_weights(save_path)
-    print(f"\n[System] Model weights saved to: {save_path}")
+    for col_idx, save_name in zip([0, 1], ["svgp_col0.h5", "svgp_col1.h5"]):
+        col_data = _slice_data_for_column(data, col_idx)
+        model = build_model(col_data["X_norm"], col_data["Y_norm"], total_steps)
+        _dry_run(model, col_data["X_norm_tf"], col_data["Y_norm_tf"])
+        run_training(model, col_data, save_name)
 
 
 if __name__ == "__main__":
