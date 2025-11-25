@@ -17,6 +17,7 @@
 # =============================================================================
 
 import os
+
 # 强制使用遗留版 Keras (双重保险)
 os.environ["TF_USE_LEGACY_KERAS"] = "1"
 
@@ -28,9 +29,10 @@ import tensorflow_probability as tfp
 import tensorflow.keras as keras
 
 # 简写
-tfk  = tfp.math.psd_kernels
+tfk = tfp.math.psd_kernels
 tfpl = tfp.layers
-ki   = keras.initializers
+ki = keras.initializers
+
 
 # ------------------------------------------------------------
 # 优化器：ShojiNaturalGradient（Theorem B' with Strict Acute Angle Constraint）
@@ -41,13 +43,13 @@ class ShojiNaturalGradient(keras.optimizers.legacy.Optimizer):
     """Shoji 等（2024）Theorem B' 的 O(D) 版本，并加入严格锐角约束。"""
 
     def __init__(
-        self,
-        learning_rate=0.001,
-        momentum=0.9,
-        angle_threshold=0.5,
-        global_clipnorm=None,
-        name="ShojiNaturalGradient",
-        **kwargs,
+            self,
+            learning_rate=0.001,
+            momentum=0.9,
+            angle_threshold=0.5,
+            global_clipnorm=None,
+            name="ShojiNaturalGradient",
+            **kwargs,
     ):
         super().__init__(
             name=name,
@@ -74,7 +76,7 @@ class ShojiNaturalGradient(keras.optimizers.legacy.Optimizer):
         g_cand = beta * g_prev + (1.0 - beta) * y
 
         cos_sim = tf.reduce_sum(y * g_cand) / (
-            tf.norm(y) * tf.norm(g_cand) + eps_div
+                tf.norm(y) * tf.norm(g_cand) + eps_div
         )
 
         def reset_dir():
@@ -103,35 +105,38 @@ class ShojiNaturalGradient(keras.optimizers.legacy.Optimizer):
             "angle_threshold": self.angle_threshold,
         }
 
+
 # ------------------------------------------------------------
 # 可调参数
 # ------------------------------------------------------------
-USE_FLOAT64    = False             # 如需更稳可设 True（并把 JITTER 降到 1e-5 左右）
-DTYPE          = tf.float64 if USE_FLOAT64 else tf.float32
-np.random.seed(42); tf.random.set_seed(42)
+USE_FLOAT64 = False  # 如需更稳可设 True（并把 JITTER 降到 1e-5 左右）
+DTYPE = tf.float64 if USE_FLOAT64 else tf.float32
+np.random.seed(42);
+tf.random.set_seed(42)
 tf.keras.backend.set_floatx('float64' if USE_FLOAT64 else 'float32')
 
 # 训练超参
-LEARNING_RATE  = 1e-3
-EPOCHS         = 50
-BATCH_SIZE     = 256
-JITTER         = 1e-4
-NU             = 0.30               # 泊松比
-WARP_DIM       = 2                  # 对 crack_n 开方 warp（0-based 第2列）
-WARP_EPS       = 1e-6
-NOISE0         = 1e-1               # 观测噪声方差初值（softplus 逆会处理）
-KL_SCALE       = 1.0
+LEARNING_RATE = 1e-3
+EPOCHS = 200
+BATCH_SIZE = 256
+JITTER = 1e-4
+NU = 0.30  # 泊松比
+WARP_DIM = 2  # 对 crack_n 开方 warp（0-based 第2列）
+WARP_EPS = 1e-6
+NOISE0 = 0.05  # 观测噪声方差初值（softplus 逆会处理）
+KL_SCALE = 0.005
 
 # 物理正则控制
-PHYS_TARGET_LAM   = 1e-2            # 目标 λ
-PHYS_WARMUP_STEPS = 2000            # 前多少 step 从 0 → λ（线性爬坡）
-PHYS_FORM         = 'logratio'      # 'logratio' 或 'ratio'
-J_FLOOR_PERCENT   = 1.0             # 对每个 batch 的 J_ref，下分位数百分位（1.0 表示第 1 百分位）
-J_ABS_FLOOR       = 1e-30           # 绝对地板，避免 log(0)
+PHYS_TARGET_LAM = 1000  # 目标 λ
+PHYS_WARMUP_STEPS = 2000  # 前多少 step 从 0 → λ（线性爬坡）
+PHYS_FORM = 'logratio'  # 'logratio' 或 'ratio'
+J_FLOOR_PERCENT = 1.0  # 对每个 batch 的 J_ref，下分位数百分位（1.0 表示第 1 百分位）
+J_ABS_FLOOR = 1e-30  # 绝对地板，避免 log(0)
 
-VERBOSE           = 1                # 逐 batch 打印
-PRINT_EVERY       = 1
-DEBUG_PHYS_FLOOR  = False            # 是否打印 batch 分位数地板，默认关闭避免日志污染
+VERBOSE = 1  # 逐 batch 打印
+PRINT_EVERY = 1
+DEBUG_PHYS_FLOOR = False  # 是否打印 batch 分位数地板，默认关闭避免日志污染
+
 
 # ------------------------------------------------------------
 # 工具：复合 Simpson 权重 & E_eq 计算
@@ -161,10 +166,10 @@ def preprocess_window_eq(X_np: np.ndarray, m=20, delta_ratio=0.2):
     Ro, Rn, crack_n, theta_deg, n_FGM = [X_np[:, i].astype(np.float64) for i in range(5)]
 
     # 由几何关系得到内半径/裂尖位置/壁厚等中间量
-    Ri = Rn * Ro                     # 内半径 = 比例 * 外半径
-    Rp = Ri                          # 裂尖位置（假设在内壁）
-    Dp = Ro - Ri                     # 壁厚
-    a  = crack_n * Dp                # 裂纹深度
+    Ri = Rn * Ro  # 内半径 = 比例 * 外半径
+    Rp = Ri  # 裂尖位置（假设在内壁）
+    Dp = Ro - Ri  # 壁厚
+    a = crack_n * Dp  # 裂纹深度
 
     # 基础几何合法性校验，提前拦截不合理样本
     if np.any(Dp <= 0):
@@ -178,11 +183,11 @@ def preprocess_window_eq(X_np: np.ndarray, m=20, delta_ratio=0.2):
     r_tip = Rp + a
     Delta = np.maximum(1e-12, delta_ratio * a)  # 窗口半宽的基准值
 
-    left_half  = np.minimum(Delta, r_tip - Rp)          # 向内的最大可行半宽
-    right_half = np.minimum(Delta, Rp + Dp - r_tip)     # 向外的最大可行半宽
-    half = np.minimum(left_half, right_half)            # 取两侧最小，确保对称
+    left_half = np.minimum(Delta, r_tip - Rp)  # 向内的最大可行半宽
+    right_half = np.minimum(Delta, Rp + Dp - r_tip)  # 向外的最大可行半宽
+    half = np.minimum(left_half, right_half)  # 取两侧最小，确保对称
     left, right = r_tip - half, r_tip + half
-    Delta_eff = right - left                            # 实际窗口宽度
+    Delta_eff = right - left  # 实际窗口宽度
 
     if np.any(Delta_eff <= 0):
         bad = np.where(Delta_eff <= 0)[0]
@@ -203,12 +208,12 @@ def preprocess_window_eq(X_np: np.ndarray, m=20, delta_ratio=0.2):
         r_i = np.clip(r_i, Rp[i], Rp[i] + Dp[i])
 
         # xi: 归一化径向坐标，Ei: 对应梯度模量分布
-        xi  = 1.0 - (r_i - Rp[i]) / Dp[i]
-        Ei  = E0 + dE * np.power(xi, n_FGM[i])
+        xi = 1.0 - (r_i - Rp[i]) / Dp[i]
+        Ei = E0 + dE * np.power(xi, n_FGM[i])
 
         # Simpson 复合积分并除以窗口宽度，得到平均等效模量
         integral = (h[i] / 3.0) * np.dot(w, Ei)
-        Eeq[i]   = integral / Delta_eff[i]
+        Eeq[i] = integral / Delta_eff[i]
 
     # 返回辅助中间量，便于调试/验证几何
     aux = dict(
@@ -217,6 +222,7 @@ def preprocess_window_eq(X_np: np.ndarray, m=20, delta_ratio=0.2):
         m=m, delta_ratio=delta_ratio,
     )
     return Eeq.astype(np.float32), aux
+
 
 # ------------------------------------------------------------
 # 数据校验 & 预处理：先 warp(crack_n) 再 z-score
@@ -257,22 +263,29 @@ def validate_and_prepare(X_raw: np.ndarray, Y_raw: np.ndarray):
     Yc = Y_raw[keep_mask].astype(np.float64)
 
     # 物理约束：半径比例与裂纹比例均应在 (0,1)
-    Ro  = Xc[:,0]; Rn = Xc[:,1]; crack_n = Xc[:,2]
+    Ro = Xc[:, 0];
+    Rn = Xc[:, 1];
+    crack_n = Xc[:, 2]
     if np.any(Ro <= 0):
-        bad = np.where(Ro <= 0)[0]; raise ValueError(f"存在 Ro<=0，样本行: {bad[:10]} ...")
+        bad = np.where(Ro <= 0)[0];
+        raise ValueError(f"存在 Ro<=0，样本行: {bad[:10]} ...")
     if np.any((Rn <= 0) | (Rn >= 1)):
-        bad = np.where((Rn <= 0) | (Rn >= 1))[0]; raise ValueError(f"R_n 必须在 (0,1)，样本行: {bad[:10]} ...")
+        bad = np.where((Rn <= 0) | (Rn >= 1))[0];
+        raise ValueError(f"R_n 必须在 (0,1)，样本行: {bad[:10]} ...")
     if np.any((crack_n <= 0) | (crack_n >= 1)):
-        bad = np.where((crack_n <= 0) | (crack_n >= 1))[0]; raise ValueError(f"crack_n 必须在 (0,1)，样本行: {bad[:10]} ...")
+        bad = np.where((crack_n <= 0) | (crack_n >= 1))[0];
+        raise ValueError(f"crack_n 必须在 (0,1)，样本行: {bad[:10]} ...")
 
     # 几何一致性：裂纹深度 a 必须小于壁厚 Dp
     Ri = Rn * Ro
     Dp = Ro - Ri
-    a  = crack_n * Dp
+    a = crack_n * Dp
     if np.any(Dp <= 0):
-        bad = np.where(Dp <= 0)[0]; raise ValueError(f"存在 Dp<=0（壁厚非正），样本行: {bad[:10]} ...")
+        bad = np.where(Dp <= 0)[0];
+        raise ValueError(f"存在 Dp<=0（壁厚非正），样本行: {bad[:10]} ...")
     if np.any((a <= 0) | (a >= Dp)):
-        bad = np.where((a <= 0) | (a >= Dp))[0]; raise ValueError(f"a 不在 (0,Dp)，样本行: {bad[:10]} ...")
+        bad = np.where((a <= 0) | (a >= Dp))[0];
+        raise ValueError(f"a 不在 (0,Dp)，样本行: {bad[:10]} ...")
 
     # pre-warp crack_n：对裂纹比例开方，缓解极小值导致的梯度尖锐
     X_warp = Xc.copy()
@@ -280,13 +293,13 @@ def validate_and_prepare(X_raw: np.ndarray, Y_raw: np.ndarray):
 
     # z-score（针对 warp 后数据）：避免零方差造成除零
     X_mean = X_warp.mean(axis=0)
-    X_std  = X_warp.std(axis=0)
+    X_std = X_warp.std(axis=0)
     X_std[X_std == 0] = 1.0
     X_norm = (X_warp - X_mean) / X_std
 
     # Y 标准化
     Y_mean = Yc.mean(axis=0)
-    Y_std  = Yc.std(axis=0)
+    Y_std = Yc.std(axis=0)
     Y_std[Y_std == 0] = 1.0
     Y_norm = (Yc - Y_mean) / Y_std
 
@@ -307,6 +320,7 @@ def validate_and_prepare(X_raw: np.ndarray, Y_raw: np.ndarray):
         keep_mask,
     )
 
+
 # ------------------------------------------------------------
 # ARD RBF 核（不含 FeatureTransformed）
 # ------------------------------------------------------------
@@ -323,15 +337,18 @@ class ARDRBFKernelLayer(keras.layers.Layer):
             name="length_scale_diag", shape=[input_dim],
             initializer=ki.Constant(np.log(np.expm1(length_scale_diag))),
             dtype=DTYPE, trainable=True)
+
     @property
     def kernel(self):
         amp = tf.nn.softplus(self._amp_unconstrained)
-        ls  = tf.nn.softplus(self._ls_unconstrained) + tf.cast(1e-12, DTYPE)
+        ls = tf.nn.softplus(self._ls_unconstrained) + tf.cast(1e-12, DTYPE)
         base = tfk.ExponentiatedQuadratic(amplitude=amp, length_scale=1.0)
-        ard  = tfk.FeatureScaled(base, scale_diag=ls)
+        ard = tfk.FeatureScaled(base, scale_diag=ls)
         return ard
+
     def call(self, inputs, **kwargs):
         return inputs
+
 
 # ------------------------------------------------------------
 # 日志辅助
@@ -340,25 +357,28 @@ class ARDRBFKernelLayer(keras.layers.Layer):
 def _format_log(epoch: int, step: int, steps_per_epoch: int, metrics: dict) -> str:
     """格式化单步训练日志，方便在训练循环中复用。"""
     return (
-        f"Epoch {epoch+1}/{EPOCHS} Step {step}/{steps_per_epoch} "
+        f"Epoch {epoch + 1}/{EPOCHS} Step {step}/{steps_per_epoch} "
         f"- loss: {metrics['loss']:.6e} - nll: {metrics['nll']:.6e} - kl: {metrics['kl']:.6e} "
         f"- phys: {metrics['phys']:.6e} - lam:{metrics['lam']:.2e} "
         f"- r_mean:{metrics['r_mean']:.2e} - J_floor:{metrics['J_floor']:.3e}"
     )
 
 
-def _self_check(X_np_raw: np.ndarray, keep_mask_np: np.ndarray, X_norm_tf: tf.Tensor, X_mean: np.ndarray, X_std: np.ndarray):
+def _self_check(X_np_raw: np.ndarray, keep_mask_np: np.ndarray, X_norm_tf: tf.Tensor, X_mean: np.ndarray,
+                X_std: np.ndarray):
     """轻量自测，确保关键计算与 warp 一致，便于导入模块时快速发现问题。"""
     assert _simpson_weights(4).tolist() == [1.0, 4.0, 2.0, 4.0, 1.0]
-    Xtoy = np.array([[2.0,0.5,0.2,0.0,1.0],[3.0,0.6,0.3,45.0,2.0]], dtype=np.float32)
-    _e_toy,_ = preprocess_window_eq(Xtoy, m=20, delta_ratio=0.2)
-    assert _e_toy.shape==(2,) and np.all(_e_toy>0)
+    Xtoy = np.array([[2.0, 0.5, 0.2, 0.0, 1.0], [3.0, 0.6, 0.3, 45.0, 2.0]], dtype=np.float32)
+    _e_toy, _ = preprocess_window_eq(Xtoy, m=20, delta_ratio=0.2)
+    assert _e_toy.shape == (2,) and np.all(_e_toy > 0)
 
     # warp 一致性检查：除 warp 维度外保持一致
     _tmp = X_np_raw[keep_mask_np].astype(np.float64)
-    _tmp_w = _tmp.copy(); _tmp_w[:,WARP_DIM] = np.sqrt(np.maximum(0.0,_tmp_w[:,WARP_DIM])+WARP_EPS)
-    _mask_other = np.ones(5, dtype=bool); _mask_other[WARP_DIM]=False
-    assert np.allclose(_tmp[:,_mask_other], _tmp_w[:,_mask_other])
+    _tmp_w = _tmp.copy();
+    _tmp_w[:, WARP_DIM] = np.sqrt(np.maximum(0.0, _tmp_w[:, WARP_DIM]) + WARP_EPS)
+    _mask_other = np.ones(5, dtype=bool);
+    _mask_other[WARP_DIM] = False
+    assert np.allclose(_tmp[:, _mask_other], _tmp_w[:, _mask_other])
 
     # 标准化后应为零均值（数值误差允许 1e-6）
     _norm_mean = tf.reduce_mean(X_norm_tf, axis=0).numpy()
@@ -406,9 +426,9 @@ def load_data_and_prepare(mat_path: str = "matlab_input.mat"):
     # 转 Tensor
     X_norm_tf = tf.convert_to_tensor(X_norm, dtype=DTYPE)
     Y_norm_tf = tf.convert_to_tensor(Y_norm, dtype=DTYPE)
-    Eeq_tf    = tf.convert_to_tensor(Eeq_np, dtype=DTYPE)
+    Eeq_tf = tf.convert_to_tensor(Eeq_np, dtype=DTYPE)
     Y_mean_tf = tf.convert_to_tensor(Y_mean, dtype=DTYPE)
-    Y_std_tf  = tf.convert_to_tensor(Y_std,  dtype=DTYPE)
+    Y_std_tf = tf.convert_to_tensor(Y_std, dtype=DTYPE)
 
     _self_check(X_np_raw, keep_mask_np, X_norm_tf, X_mean, X_std)
 
@@ -448,11 +468,16 @@ def _identity_with_shape(dist: tfp.distributions.Distribution):
         # the attribute access used by distribution_layer.py. This is pure-Python
         # metadata and does not touch graph ops or gradients.
         dist.shape = dist.batch_shape.concatenate(dist.event_shape)
+
+    if not hasattr(dist, "get_shape"):
+        dist.get_shape = lambda: dist.shape
+
+
     return dist
 
 
 def build_model(
-    X_norm: np.ndarray, Y_norm: np.ndarray, total_steps: int | None = None
+        X_norm: np.ndarray, Y_norm: np.ndarray, total_steps: int | None = None
 ):
     """构建 SVGP 模型（显式返回分布对象，避免依赖 Keras 副作用）。"""
     if total_steps is None:
@@ -461,7 +486,7 @@ def build_model(
     total_steps = max(1, int(total_steps))
 
     num_inducing = int(min(1000, X_norm.shape[0]))
-    D_out        = int(Y_norm.shape[1])
+    D_out = int(Y_norm.shape[1])
 
     inducing_init = X_norm[np.random.choice(X_norm.shape[0], size=num_inducing, replace=False)]
     inducing_init_multi = np.stack([inducing_init] * D_out, axis=0).astype(np.float64 if USE_FLOAT64 else np.float32)
@@ -471,7 +496,7 @@ def build_model(
 
     vgp_layer = tfpl.VariationalGaussianProcess(
         num_inducing_points=num_inducing,
-        kernel_provider=ARDRBFKernelLayer(amplitude=0.5, length_scale_diag=np.ones(5, np.float32), input_dim=5),
+        kernel_provider=ARDRBFKernelLayer(amplitude=0.5, length_scale_diag=np.ones(5, np.float32) * 0.1, input_dim=5),
         event_shape=(D_out,),
         inducing_index_points_initializer=ki.Constant(inducing_init_multi),
         unconstrained_observation_noise_variance_initializer=ki.Constant(np.log(np.expm1(NOISE0))),
@@ -480,6 +505,8 @@ def build_model(
         convert_to_tensor_fn=_identity_with_shape,  # 返回分布对象并附加 shape 元数据
         name="SVGPLayer",
     )
+
+
 
     model = SVGPModel(vgp_layer)
     _ = model(tf.zeros([1, 5], dtype=DTYPE))  # 预构建变量，便于 summary/save_weights
@@ -528,11 +555,11 @@ def make_train_step(model: keras.Model, Y_std_tf: tf.Tensor, Y_mean_tf: tf.Tenso
 
             # 反标准化到物理量（确保正则作用在真实尺度上）
             y_pred_mean = rv.mean()
-            K_pred = y_pred_mean*Y_std_tf + Y_mean_tf
-            K_true = y_batch*Y_std_tf + Y_mean_tf
+            K_pred = y_pred_mean * Y_std_tf + Y_mean_tf
+            K_true = y_batch * Y_std_tf + Y_mean_tf
 
             # E'：平面应变（或应力）。若要切换到平面应力，可直接使用 eeq_phys_batch。
-            Eprime = eeq_phys_batch/(1.0-NU**2)
+            Eprime = eeq_phys_batch / (1.0 - NU ** 2)
 
             # 物理 J（带绝对地板，避免除零）
             eps = tf.cast(J_ABS_FLOOR, DTYPE)
@@ -603,21 +630,21 @@ def run_training(model: keras.Model, data: dict):
                 "J_floor": float(out['J_floor'].numpy()),
             }
 
-            if VERBOSE and (step % PRINT_EVERY == 0 or step==1 or step==steps_per_epoch):
+            if VERBOSE and (step % PRINT_EVERY == 0 or step == 1 or step == steps_per_epoch):
                 print(_format_log(epoch, step, steps_per_epoch, metrics))
 
             if not np.isfinite(metrics["loss"]) or not np.isfinite(metrics["nll"]) or not np.isfinite(metrics["phys"]):
-                print(f"\n[NaN DETECTED] at epoch {epoch+1}, step {step}")
+                print(f"\n[NaN DETECTED] at epoch {epoch + 1}, step {step}")
                 # 打印该 batch 的安全统计，便于定位
-                Kp = (model(xb, training=False).mean()*data["Y_std_tf"] + data["Y_mean_tf"]).numpy()
-                Kt = (yb*data["Y_std_tf"] + data["Y_mean_tf"]).numpy()
-                Eb = eb.numpy()/ (1-NU**2)
+                Kp = (model(xb, training=False).mean() * data["Y_std_tf"] + data["Y_mean_tf"]).numpy()
+                Kt = (yb * data["Y_std_tf"] + data["Y_mean_tf"]).numpy()
+                Eb = eb.numpy() / (1 - NU ** 2)
                 print("K_pred stats -> min/median/max:", np.nanmin(Kp), np.nanmedian(Kp), np.nanmax(Kp))
                 print("K_true stats -> min/median/max:", np.nanmin(Kt), np.nanmedian(Kt), np.nanmax(Kt))
                 print("E' stats -> min/median/max:", np.nanmin(Eb), np.nanmedian(Eb), np.nanmax(Eb))
                 raise RuntimeError("Loss became NaN/Inf; see stats above.")
 
-        print(f"epoch {epoch+1} done")
+        print(f"epoch {epoch + 1} done")
 
 
 def main():
@@ -626,7 +653,7 @@ def main():
     model = build_model(data["X_norm"], data["Y_norm"], total_steps)
     _dry_run(model, data["X_norm_tf"], data["Y_norm_tf"])
     run_training(model, data)
-    
+
     save_path = "svgp_shoji_weights.h5"
     model.save_weights(save_path)
     print(f"\n[System] Model weights saved to: {save_path}")
@@ -634,6 +661,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 # ------------------------------------------------------------
 # 批量预测工具（避免一次性对全部样本构造 K(X,X) 导致 OOM）
@@ -643,12 +671,11 @@ def predict_mean_batched(model, X_tf: tf.Tensor, batch_size: int = 8192):
     means = []
     N = X_tf.shape[0]
     for i in range(0, N, batch_size):
-        rv = model(X_tf[i:i+batch_size], training=False)
+        rv = model(X_tf[i:i + batch_size], training=False)
         means.append(rv.mean().numpy())
     return np.vstack(means)
 
 # 示例：仅在需要时调用
 # pred_norm = predict_mean_batched(model, X_norm_tf, batch_size=4096)
 # print("Predictive mean (first 3 rows, normalized):\n", pred_norm[:3])
-
 
