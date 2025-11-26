@@ -133,6 +133,7 @@ class SVGPHyperParams:
     kl_scale: float = 0.01
     amplitude: float = DEFAULT_AMPLITUDE
     length_scale_diag: np.ndarray = field(default_factory=lambda: DEFAULT_LENGTH_SCALES.copy())
+    phys_lam: float = PHYS_TARGET_LAM
     num_inducing: int | None = None
 
     def __post_init__(self):
@@ -228,6 +229,7 @@ def _hp_from_metadata(raw: str | dict | None) -> SVGPHyperParams:
         kl_scale=data.get("kl_scale", 0.01),
         amplitude=data.get("amplitude", DEFAULT_AMPLITUDE),
         length_scale_diag=np.array(data.get("length_scale_diag", DEFAULT_LENGTH_SCALES), np.float32),
+        phys_lam=data.get("phys_lam", PHYS_TARGET_LAM),
         num_inducing=data.get("num_inducing"),
     )
 

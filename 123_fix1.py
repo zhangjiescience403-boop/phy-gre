@@ -152,6 +152,7 @@ class SVGPHyperParams:
     kl_scale: float = KL_SCALE
     amplitude: float = DEFAULT_AMPLITUDE
     length_scale_diag: np.ndarray = field(default_factory=lambda: DEFAULT_LENGTH_SCALES.copy())
+    phys_lam: float = PHYS_TARGET_LAM
     num_inducing: int | None = None
 
     def __post_init__(self):
@@ -714,7 +715,7 @@ def _evaluate_config(hp: SVGPHyperParams, data: dict, val_data: dict | None = No
             iterator = iter(ds)
             xb, yb, eb = next(iterator)
         step_counter.assign_add(1)
-        lam_value = tf.cast(PHYS_TARGET_LAM, DTYPE) * tf.minimum(
+        lam_value = tf.cast(hp_used.phys_lam, DTYPE) * tf.minimum(
             tf.cast(1.0, DTYPE),
             tf.cast(step_counter, DTYPE) / tf.cast(PHYS_WARMUP_STEPS, DTYPE),
         )
@@ -733,18 +734,35 @@ def _evaluate_config(hp: SVGPHyperParams, data: dict, val_data: dict | None = No
     return float(nll_train.numpy()), val_nll
 
 
-def hyperparameter_search(data: dict, col_idx: int, max_trials: int = 5) -> SVGPHyperParams:
+def hyperparameter_search(data: dict, col_idx: int, max_trials: int = 12) -> SVGPHyperParams:
     train_idx, val_idx = _train_val_split(data["X_norm"].shape[0])
     train_data = _materialize_subset(_slice_data_for_column(data, col_idx), train_idx)
     val_data = _materialize_subset(_slice_data_for_column(data, col_idx), val_idx)
 
+    # 评估搜索空间是否过大：每个维度保持 2~3 个粗粒度档位，可覆盖主要变化趋势又避免组合爆炸
+    length_scale_candidates = [DEFAULT_LENGTH_SCALES * 0.7, DEFAULT_LENGTH_SCALES, DEFAULT_LENGTH_SCALES * 1.3]
+    phys_lam_candidates = [600.0, 1000.0]
     search_space = [
-        SVGPHyperParams(learning_rate=lr, noise0=n0, kl_scale=kl, amplitude=amp)
+        SVGPHyperParams(
+            learning_rate=lr,
+            noise0=n0,
+            kl_scale=kl,
+            amplitude=amp,
+            length_scale_diag=ls,
+            phys_lam=pl,
+        )
         for lr in (5e-4, 1e-3)
         for n0 in (0.02, 0.05)
         for kl in (0.005, 0.01)
         for amp in (0.4, 0.6)
+        for ls in length_scale_candidates
+        for pl in phys_lam_candidates
     ]
+
+    # 空间上限：先打乱再按 max_trials 抽样，确保覆盖多维组合且避免过大搜索成本
+    rng = np.random.default_rng(42)
+    rng.shuffle(search_space)
+    search_space = search_space[:max_trials]
 
     best_hp = SVGPHyperParams()
     best_score = float("inf")
@@ -755,7 +773,11 @@ def hyperparameter_search(data: dict, col_idx: int, max_trials: int = 5) -> SVGP
         if total_score < best_score:
             best_score = total_score
             best_hp = hp
-        print(f"[HyperOpt] Trial {trial}: lr={hp.learning_rate}, noise0={hp.noise0}, kl={hp.kl_scale}, amp={hp.amplitude}, score={total_score:.4f}")
+        print(
+            f"[HyperOpt] Trial {trial}: lr={hp.learning_rate}, noise0={hp.noise0}, kl={hp.kl_scale}, "
+            f"amp={hp.amplitude}, phys_lam={hp.phys_lam}, ls_scale={np.mean(hp.length_scale_diag/DEFAULT_LENGTH_SCALES):.2f}, "
+            f"score={total_score:.4f}"
+        )
 
     return best_hp
 
@@ -779,7 +801,7 @@ def run_training(model: keras.Model, data: dict, save_name: str, hyperparams: SV
     for epoch in range(EPOCHS):
         for step, (xb, yb, eb) in enumerate(base_dataset, start=1):
             step_counter.assign_add(1)
-            lam_value = tf.cast(PHYS_TARGET_LAM, DTYPE) * tf.minimum(
+            lam_value = tf.cast(hyperparams.phys_lam, DTYPE) * tf.minimum(
                 tf.cast(1.0, DTYPE),
                 tf.cast(step_counter, DTYPE) / tf.cast(PHYS_WARMUP_STEPS, DTYPE),
             )
