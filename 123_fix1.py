@@ -487,6 +487,7 @@ def load_data_and_prepare(mat_path: str = "matlab_input.mat"):
     return dict(
         X_norm=X_norm,
         Y_norm=Y_norm,
+        Eeq=Eeq_np,
         X_norm_tf=X_norm_tf,
         Y_norm_tf=Y_norm_tf,
         Eeq_tf=Eeq_tf,
@@ -700,7 +701,7 @@ def _materialize_subset(data: dict, train_idx: np.ndarray) -> dict:
     }
 
 
-def _evaluate_config(hp: SVGPHyperParams, data: dict, val_data: dict | None = None, steps: int = 40) -> tuple[float, float | None]:
+def _evaluate_config(hp: SVGPHyperParams, data: dict, val_data: dict | None = None, steps: int = 50) -> tuple[float, float | None]:
     model, hp_used = build_model(data["X_norm"], data["Y_norm"], total_steps=steps, hyperparams=hp)
     train_step_phys = make_train_step(model, data["Y_std_tf"], data["Y_mean_tf"], hp_used.kl_scale)
 
@@ -708,16 +709,24 @@ def _evaluate_config(hp: SVGPHyperParams, data: dict, val_data: dict | None = No
     iterator = iter(ds)
     lam_var = tf.Variable(0.0, dtype=DTYPE, trainable=False)
     step_counter = tf.Variable(0, dtype=tf.int64, trainable=False)
+
+    # === 关键修改：评估阶段的快速热身 ===
+    # 我们希望在 evaluation 的中后段（例如第 25 步以后），物理权重能达到设定的峰值
+    # 这样 HyperOpt 才能检测出该参数是否会导致物理 Loss 爆炸
+    eval_warmup_steps = steps // 2
+
     for _ in range(steps):
         try:
             xb, yb, eb = next(iterator)
         except StopIteration:
             iterator = iter(ds)
             xb, yb, eb = next(iterator)
+
         step_counter.assign_add(1)
+
         lam_value = tf.cast(hp_used.phys_lam, DTYPE) * tf.minimum(
             tf.cast(1.0, DTYPE),
-            tf.cast(step_counter, DTYPE) / tf.cast(PHYS_WARMUP_STEPS, DTYPE),
+            tf.cast(step_counter, DTYPE) / tf.cast(eval_warmup_steps, DTYPE),
         )
         lam_var.assign(lam_value)
         _ = train_step_phys(xb, yb, eb, lam_var)
@@ -739,9 +748,22 @@ def hyperparameter_search(data: dict, col_idx: int, max_trials: int = 12) -> SVG
     train_data = _materialize_subset(_slice_data_for_column(data, col_idx), train_idx)
     val_data = _materialize_subset(_slice_data_for_column(data, col_idx), val_idx)
 
-    # 评估搜索空间是否过大：每个维度保持 2~3 个粗粒度档位，可覆盖主要变化趋势又避免组合爆炸
-    length_scale_candidates = [DEFAULT_LENGTH_SCALES * 0.7, DEFAULT_LENGTH_SCALES, DEFAULT_LENGTH_SCALES * 1.3]
-    phys_lam_candidates = [600.0, 1000.0]
+    # === 关键修改：更激进的 Length Scale 搜索 ===
+    # 使用倍数乘法，覆盖更广的尺度
+    ls_multipliers = [0.5, 1.0, 2.0, 4.0]
+    length_scale_candidates = [DEFAULT_LENGTH_SCALES * m for m in ls_multipliers]
+
+    # === 关键修改：针对 K_II (col_idx=1) 降低物理权重下限 ===
+    if col_idx == 1:
+        # K_II 比较难学，允许尝试很小的物理权重（先学数据），也允许尝试大的
+        phys_lam_candidates = [10.0, 100.0, 600.0]
+        # K_II 也许需要更小的噪声假设来强迫拟合
+        noise_candidates = [0.005, 0.05]
+    else:
+        # K_I 比较健壮，保持原有策略
+        phys_lam_candidates = [600.0, 1000.0]
+        noise_candidates = [0.05]
+
     search_space = [
         SVGPHyperParams(
             learning_rate=lr,
@@ -751,10 +773,10 @@ def hyperparameter_search(data: dict, col_idx: int, max_trials: int = 12) -> SVG
             length_scale_diag=ls,
             phys_lam=pl,
         )
-        for lr in (5e-4, 1e-3)
-        for n0 in (0.02, 0.05)
-        for kl in (0.005, 0.01)
-        for amp in (0.4, 0.6)
+        for lr in (1e-3,)
+        for n0 in noise_candidates
+        for kl in (0.01,)
+        for amp in (0.5,)
         for ls in length_scale_candidates
         for pl in phys_lam_candidates
     ]
