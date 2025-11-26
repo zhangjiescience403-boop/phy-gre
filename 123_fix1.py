@@ -398,10 +398,11 @@ class ARDRBFKernelLayer(keras.layers.Layer):
 # 日志辅助
 # ------------------------------------------------------------
 
-def _format_log(epoch: int, step: int, steps_per_epoch: int, metrics: dict) -> str:
+def _format_log(epoch: int, step: int, steps_per_epoch: int, metrics: dict, prefix: str = "") -> str:
     """格式化单步训练日志，方便在训练循环中复用。"""
+    prefix_fmt = f"{prefix} " if prefix else ""
     return (
-        f"Epoch {epoch + 1}/{EPOCHS} Step {step}/{steps_per_epoch} "
+        f"{prefix_fmt}Epoch {epoch + 1}/{EPOCHS} Step {step}/{steps_per_epoch} "
         f"- loss: {metrics['loss']:.6e} - nll: {metrics['nll']:.6e} - kl: {metrics['kl']:.6e} "
         f"- phys: {metrics['phys']:.6e} - lam:{metrics['lam']:.2e} "
         f"- r_mean:{metrics['r_mean']:.2e} - J_floor:{metrics['J_floor']:.3e}"
@@ -701,6 +702,22 @@ def _materialize_subset(data: dict, train_idx: np.ndarray) -> dict:
     }
 
 
+def _compute_batched_nll(model: keras.Model, x_tf: tf.Tensor, y_tf: tf.Tensor, batch_size: int = BATCH_SIZE) -> float:
+    """逐 batch 评估 NLL，避免一次性构造巨大核矩阵导致 OOM。"""
+
+    ds = tf.data.Dataset.from_tensor_slices((x_tf, y_tf)).batch(batch_size)
+    total_log_prob = tf.cast(0.0, DTYPE)
+    total_count = tf.cast(0, DTYPE)
+
+    for xb, yb in ds:
+        rv = model(xb, training=False)
+        lp = rv.log_prob(yb)
+        total_log_prob += tf.reduce_sum(lp)
+        total_count += tf.cast(tf.size(lp), DTYPE)
+
+    return float(-(total_log_prob / total_count).numpy())
+
+
 def _evaluate_config(hp: SVGPHyperParams, data: dict, val_data: dict | None = None, steps: int = 50) -> tuple[float, float | None]:
     model, hp_used = build_model(data["X_norm"], data["Y_norm"], total_steps=steps, hyperparams=hp)
     train_step_phys = make_train_step(model, data["Y_std_tf"], data["Y_mean_tf"], hp_used.kl_scale)
@@ -729,18 +746,28 @@ def _evaluate_config(hp: SVGPHyperParams, data: dict, val_data: dict | None = No
             tf.cast(step_counter, DTYPE) / tf.cast(eval_warmup_steps, DTYPE),
         )
         lam_var.assign(lam_value)
-        _ = train_step_phys(xb, yb, eb, lam_var)
+        out = train_step_phys(xb, yb, eb, lam_var)
 
-    # Validation NLL 作为评分，数值越低越好
-    rv_train = model(data["X_norm_tf"], training=False)
-    nll_train = -tf.reduce_mean(rv_train.log_prob(data["Y_norm_tf"]))
+        if VERBOSE and (int(step_counter.numpy()) % PRINT_EVERY == 0):
+            metrics = {
+                "loss": float(out['loss'].numpy()),
+                "nll": float(out['nll'].numpy()),
+                "kl": float(out['kl'].numpy()),
+                "phys": float(out['phys'].numpy()),
+                "lam": float(out['lam'].numpy()),
+                "r_mean": float(out['r_mean'].numpy()),
+                "J_floor": float(out['J_floor'].numpy()),
+            }
+            print(_format_log(0, int(step_counter.numpy()), steps, metrics, prefix="[HyperOpt]"))
+
+    # Validation NLL 作为评分，数值越低越好（逐 batch 计算以防 OOM）
+    nll_train = _compute_batched_nll(model, data["X_norm_tf"], data["Y_norm_tf"])
 
     val_nll = None
     if val_data is not None:
-        rv_val = model(val_data["X_norm_tf"], training=False)
-        val_nll = float(-tf.reduce_mean(rv_val.log_prob(val_data["Y_norm_tf"])) .numpy())
+        val_nll = _compute_batched_nll(model, val_data["X_norm_tf"], val_data["Y_norm_tf"])
 
-    return float(nll_train.numpy()), val_nll
+    return nll_train, val_nll
 
 
 def hyperparameter_search(data: dict, col_idx: int, max_trials: int = 12) -> SVGPHyperParams:
