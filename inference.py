@@ -5,11 +5,15 @@ and ShojiNaturalGradient optimizer, loads the trained weights, and performs
 batched prediction to avoid OOM issues.
 """
 
+import json
 import os
 import math
 import numpy as np
 import pandas as pd
 import scipy.io as sio
+from dataclasses import dataclass, field
+
+import h5py
 
 # Ensure legacy Keras APIs stay enabled (must be set before importing tf)
 os.environ["TF_USE_LEGACY_KERAS"] = "1"
@@ -112,12 +116,28 @@ NU = 0.30
 WARP_DIM = 2
 WARP_EPS = 1e-6
 NOISE0 = 1e-1
+DEFAULT_AMPLITUDE = 0.5
+DEFAULT_LENGTH_SCALES = np.array([2.0, 0.5, 0.5, 0.1, 0.1, 2.0], np.float32)
 
 PHYS_TARGET_LAM = 1000
 PHYS_WARMUP_STEPS = 2000
 PHYS_FORM = "logratio"
 J_FLOOR_PERCENT = 1.0
 J_ABS_FLOOR = 1e-30
+
+
+@dataclass
+class SVGPHyperParams:
+    learning_rate: float = LEARNING_RATE
+    noise0: float = NOISE0
+    kl_scale: float = 0.01
+    amplitude: float = DEFAULT_AMPLITUDE
+    length_scale_diag: np.ndarray = field(default_factory=lambda: DEFAULT_LENGTH_SCALES.copy())
+    num_inducing: int | None = None
+
+    def __post_init__(self):
+        if self.length_scale_diag is None:
+            object.__setattr__(self, "length_scale_diag", DEFAULT_LENGTH_SCALES.copy())
 
 
 # -----------------------------------------------------------------------------
@@ -192,6 +212,24 @@ def preprocess_window_eq(X_np: np.ndarray, m=20, delta_ratio=0.2):
         delta_ratio=delta_ratio,
     )
     return Eeq.astype(np.float32), aux
+
+
+def _hp_from_metadata(raw: str | dict | None) -> SVGPHyperParams:
+    if raw is None:
+        return SVGPHyperParams()
+    data = raw
+    if isinstance(raw, bytes):
+        data = raw.decode("utf-8")
+    if isinstance(data, str):
+        data = json.loads(data)
+    return SVGPHyperParams(
+        learning_rate=data.get("learning_rate", LEARNING_RATE),
+        noise0=data.get("noise0", NOISE0),
+        kl_scale=data.get("kl_scale", 0.01),
+        amplitude=data.get("amplitude", DEFAULT_AMPLITUDE),
+        length_scale_diag=np.array(data.get("length_scale_diag", DEFAULT_LENGTH_SCALES), np.float32),
+        num_inducing=data.get("num_inducing"),
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -473,7 +511,10 @@ def _identity_with_shape(dist: tfp.distributions.Distribution):
 
 
 def build_model(
-    X_norm: np.ndarray, Y_norm: np.ndarray, total_steps: int | None = None
+    X_norm: np.ndarray,
+    Y_norm: np.ndarray,
+    total_steps: int | None = None,
+    hyperparams: SVGPHyperParams | None = None,
 ):
     """构建 SVGP 模型（显式返回分布对象，避免依赖 Keras 副作用）。"""
     if total_steps is None:
@@ -481,7 +522,8 @@ def build_model(
         total_steps = EPOCHS * batches_per_epoch
     total_steps = max(1, int(total_steps))
 
-    num_inducing = int(min(1000, X_norm.shape[0]))
+    hp = hyperparams or SVGPHyperParams()
+    num_inducing = int(hp.num_inducing or min(1000, X_norm.shape[0]))
     D_out = int(Y_norm.shape[1])
 
     inducing_init = X_norm[
@@ -500,14 +542,14 @@ def build_model(
     vgp_layer = tfpl.VariationalGaussianProcess(
         num_inducing_points=num_inducing,
         kernel_provider=ARDRBFKernelLayer(
-            amplitude=0.5,
-            length_scale_diag=np.array([2.0, 0.5, 0.5, 0.1, 0.1, 2.0], np.float32),
+            amplitude=hp.amplitude,
+            length_scale_diag=np.array(hp.length_scale_diag, np.float32),
             input_dim=6,
         ),
         event_shape=(D_out,),
         inducing_index_points_initializer=ki.Constant(inducing_init_multi),
         unconstrained_observation_noise_variance_initializer=ki.Constant(
-            np.log(np.expm1(NOISE0))
+            np.log(np.expm1(hp.noise0))
         ),
         variational_inducing_observations_scale_initializer=ki.Constant(initial_scale),
         jitter=JITTER,
@@ -522,7 +564,7 @@ def build_model(
         return -rv_pred.log_prob(y_true)
 
     lr_schedule = keras.optimizers.schedules.CosineDecay(
-        initial_learning_rate=LEARNING_RATE,
+        initial_learning_rate=hp.learning_rate,
         decay_steps=total_steps,
         alpha=0.01,
     )
@@ -534,7 +576,7 @@ def build_model(
         global_clipnorm=1.0,
     )
     model.compile(optimizer=optimizer, loss=negloglik)
-    return model
+    return model, hp
 
 
 # -----------------------------------------------------------------------------
@@ -549,23 +591,44 @@ def predict_mean_batched(model, X_tf: tf.Tensor, batch_size: int = 8192):
     return np.vstack(means)
 
 
+def _load_weight_metadata(weight_path: str):
+    with h5py.File(weight_path, "r") as f:
+        hp_raw = f.attrs.get("hyperparams")
+        target_col = int(f.attrs.get("target_column", 0))
+        stats_raw = f.attrs.get("train_stats")
+    if isinstance(stats_raw, bytes):
+        stats_raw = stats_raw.decode("utf-8")
+    return _hp_from_metadata(hp_raw), target_col, json.loads(stats_raw) if stats_raw is not None else None
+
+
 # -----------------------------------------------------------------------------
 # Inference logic
 # -----------------------------------------------------------------------------
 def load_and_predict(
-    weights_paths: tuple[str, str],
+    weights_paths: tuple[str, ...] | list[str] | str,
     X_new_raw: np.ndarray,
-    train_stats: dict,
+    train_stats: dict | None = None,
     template_data: dict | None = None,
 ):
-    """Rebuild two single-output SVGP models and predict on ``X_new_raw``.
+    """Rebuild single-output SVGP models with training-time hyperparameters.
 
-    The raw features (5 columns) are warped/normalized using training statistics.
-    Each column-specific model is loaded separately, predictions are denormalized
-    with the matching mean/std, and concatenated into a ``[N, 2]`` array.
+    All normalization stats are taken from ``train_stats`` (or the weight file
+    if ``train_stats`` is None). Each model is instantiated with the exact
+    hyperparameters stored alongside the weights to ensure inducing points,
+    kernels, and noise levels match training-time values.
     """
+    if isinstance(weights_paths, str):
+        weights_paths = (weights_paths,)
+
     if template_data is None:
         template_data = load_data_and_prepare()
+
+    loaded_meta = [_load_weight_metadata(p) for p in weights_paths]
+    stats_from_weight = next((m for _, _, m in loaded_meta if m is not None), None)
+    stats = train_stats or stats_from_weight
+    if stats is None:
+        raise ValueError("Missing normalization stats: provide train_stats or store them in weight attrs")
+    stats = {k: np.array(v, dtype=np.float64) for k, v in stats.items()}
 
     (
         _,
@@ -576,7 +639,7 @@ def load_and_predict(
         _,
         _,
         _,
-    ) = validate_and_prepare(X_new_raw, None, stats=train_stats)
+    ) = validate_and_prepare(X_new_raw, None, stats=stats)
 
     total_steps = max(
         1, EPOCHS * math.ceil(template_data["X_norm"].shape[0] / BATCH_SIZE)
@@ -584,14 +647,14 @@ def load_and_predict(
     X_tf = tf.convert_to_tensor(X_norm_new, dtype=DTYPE)
 
     preds_phys = []
-    for idx, weight_path in enumerate(weights_paths):
-        y_norm_template = template_data["Y_norm"][:, idx : idx + 1]
-        model = build_model(template_data["X_norm"], y_norm_template, total_steps)
+    for (hp, target_col, _), weight_path in zip(loaded_meta, weights_paths):
+        y_norm_template = template_data["Y_norm"][:, target_col : target_col + 1]
+        model, _ = build_model(template_data["X_norm"], y_norm_template, total_steps, hyperparams=hp)
         model.load_weights(weight_path)
 
         preds_norm_col = predict_mean_batched(model, X_tf)
-        mean_col = np.asarray(train_stats["Y_mean"], dtype=np.float64)[idx : idx + 1]
-        std_col = np.asarray(train_stats["Y_std"], dtype=np.float64)[idx : idx + 1]
+        mean_col = np.asarray(stats["Y_mean"], dtype=np.float64)[target_col : target_col + 1]
+        std_col = np.asarray(stats["Y_std"], dtype=np.float64)[target_col : target_col + 1]
         preds_phys.append(preds_norm_col * std_col + mean_col)
 
     return np.hstack(preds_phys)

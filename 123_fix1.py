@@ -16,12 +16,17 @@
 # 5) 仍保持：数据导入后**全面校验**（物理与有限性）、crack_n **pre-warp 再 z-score**。
 # =============================================================================
 
+import argparse
+import json
 import os
 
 # 强制使用遗留版 Keras (双重保险)
 os.environ["TF_USE_LEGACY_KERAS"] = "1"
 
 import math
+from dataclasses import dataclass, asdict, field
+
+import h5py
 import numpy as np
 import scipy.io as sio
 import tensorflow as tf
@@ -115,7 +120,7 @@ np.random.seed(42);
 tf.random.set_seed(42)
 tf.keras.backend.set_floatx('float64' if USE_FLOAT64 else 'float32')
 
-# 训练超参
+# 训练超参（可被超参优化覆盖）
 LEARNING_RATE = 1e-3
 EPOCHS = 150
 BATCH_SIZE = 256
@@ -125,6 +130,8 @@ WARP_DIM = 2  # 对 crack_n 开方 warp（0-based 第2列）
 WARP_EPS = 1e-6
 NOISE0 = 0.05  # 观测噪声方差初值（softplus 逆会处理）
 KL_SCALE = 0.01
+DEFAULT_AMPLITUDE = 0.5
+DEFAULT_LENGTH_SCALES = np.array([2.0, 0.5, 0.5, 0.1, 0.1, 2.0], np.float32)
 
 # 物理正则控制
 PHYS_TARGET_LAM = 1000  # 目标 λ
@@ -136,6 +143,26 @@ J_ABS_FLOOR = 1e-30  # 绝对地板，避免 log(0)
 VERBOSE = 1  # 逐 batch 打印
 PRINT_EVERY = 1
 DEBUG_PHYS_FLOOR = False  # 是否打印 batch 分位数地板，默认关闭避免日志污染
+
+
+@dataclass
+class SVGPHyperParams:
+    learning_rate: float = LEARNING_RATE
+    noise0: float = NOISE0
+    kl_scale: float = KL_SCALE
+    amplitude: float = DEFAULT_AMPLITUDE
+    length_scale_diag: np.ndarray = field(default_factory=lambda: DEFAULT_LENGTH_SCALES.copy())
+    num_inducing: int | None = None
+
+    def __post_init__(self):
+        if self.length_scale_diag is None:
+            object.__setattr__(self, "length_scale_diag", DEFAULT_LENGTH_SCALES.copy())
+
+
+def _hp_to_dict(hp: SVGPHyperParams) -> dict:
+    payload = asdict(hp)
+    payload["length_scale_diag"] = [float(x) for x in hp.length_scale_diag]
+    return payload
 
 
 # ------------------------------------------------------------
@@ -507,7 +534,10 @@ def _identity_with_shape(dist: tfp.distributions.Distribution):
 
 
 def build_model(
-        X_norm: np.ndarray, Y_norm: np.ndarray, total_steps: int | None = None
+        X_norm: np.ndarray,
+        Y_norm: np.ndarray,
+        total_steps: int | None = None,
+        hyperparams: SVGPHyperParams | None = None,
 ):
     """构建 SVGP 模型（显式返回分布对象，避免依赖 Keras 副作用）。"""
     if total_steps is None:
@@ -515,7 +545,8 @@ def build_model(
         total_steps = EPOCHS * batches_per_epoch
     total_steps = max(1, int(total_steps))
 
-    num_inducing = int(min(1000, X_norm.shape[0]))
+    hp = hyperparams or SVGPHyperParams()
+    num_inducing = int(hp.num_inducing or min(1000, X_norm.shape[0]))
     D_out = int(Y_norm.shape[1])
 
     inducing_init = X_norm[np.random.choice(X_norm.shape[0], size=num_inducing, replace=False)]
@@ -527,13 +558,13 @@ def build_model(
     vgp_layer = tfpl.VariationalGaussianProcess(
         num_inducing_points=num_inducing,
         kernel_provider=ARDRBFKernelLayer(
-            amplitude=0.5,
-            length_scale_diag=np.array([2.0, 0.5, 0.5, 0.1, 0.1, 2.0], np.float32),
+            amplitude=hp.amplitude,
+            length_scale_diag=np.array(hp.length_scale_diag, np.float32),
             input_dim=6,
         ),
         event_shape=(D_out,),
         inducing_index_points_initializer=ki.Constant(inducing_init_multi),
-        unconstrained_observation_noise_variance_initializer=ki.Constant(np.log(np.expm1(NOISE0))),
+        unconstrained_observation_noise_variance_initializer=ki.Constant(np.log(np.expm1(hp.noise0))),
         variational_inducing_observations_scale_initializer=ki.Constant(initial_scale),
         jitter=JITTER,
         convert_to_tensor_fn=_identity_with_shape,  # 返回分布对象并附加 shape 元数据
@@ -549,7 +580,7 @@ def build_model(
         return -rv_pred.log_prob(y_true)
 
     lr_schedule = keras.optimizers.schedules.CosineDecay(
-        initial_learning_rate=LEARNING_RATE,
+        initial_learning_rate=hp.learning_rate,
         decay_steps=total_steps,
         alpha=0.01,
     )
@@ -561,7 +592,7 @@ def build_model(
         global_clipnorm=1.0,
     )
     model.compile(optimizer=optimizer, loss=negloglik)
-    return model
+    return model, hp
 
 
 def _dry_run(model: keras.Model, X_norm_tf: tf.Tensor, Y_norm_tf: tf.Tensor):
@@ -573,9 +604,11 @@ def _dry_run(model: keras.Model, X_norm_tf: tf.Tensor, Y_norm_tf: tf.Tensor):
         raise RuntimeError("Dry-run log_prob 非有限：请提高 jitter/噪声或检查数据尺度。")
 
 
-def make_train_step(model: keras.Model, Y_std_tf: tf.Tensor, Y_mean_tf: tf.Tensor):
+def make_train_step(
+        model: keras.Model, Y_std_tf: tf.Tensor, Y_mean_tf: tf.Tensor, kl_scale: float
+):
     """返回带物理正则的单步训练函数，封装 warmup/地板/ratio 选择。"""
-    kl_scale_tf = tf.cast(KL_SCALE, DTYPE)
+    kl_scale_tf = tf.cast(kl_scale, DTYPE)
 
     @tf.function
     def train_step_phys(x_batch, y_batch, eeq_phys_batch, lam_var):
@@ -647,22 +680,104 @@ def _slice_data_for_column(data: dict, col_idx: int) -> dict:
     }
 
 
-def run_training(model: keras.Model, data: dict, save_name: str):
+def _train_val_split(N: int, val_ratio: float = 0.15):
+    idx = np.arange(N)
+    np.random.shuffle(idx)
+    split = int(N * (1.0 - val_ratio))
+    return idx[:split], idx[split:]
+
+
+def _materialize_subset(data: dict, train_idx: np.ndarray) -> dict:
+    return {
+        **data,
+        "X_norm": data["X_norm"][train_idx],
+        "Y_norm": data["Y_norm"][train_idx],
+        "Eeq": data["Eeq"][train_idx],
+        "X_norm_tf": tf.convert_to_tensor(data["X_norm"][train_idx], dtype=DTYPE),
+        "Y_norm_tf": tf.convert_to_tensor(data["Y_norm"][train_idx], dtype=DTYPE),
+        "Eeq_tf": tf.convert_to_tensor(data["Eeq"][train_idx], dtype=DTYPE),
+    }
+
+
+def _evaluate_config(hp: SVGPHyperParams, data: dict, val_data: dict | None = None, steps: int = 40) -> tuple[float, float | None]:
+    model, hp_used = build_model(data["X_norm"], data["Y_norm"], total_steps=steps, hyperparams=hp)
+    train_step_phys = make_train_step(model, data["Y_std_tf"], data["Y_mean_tf"], hp_used.kl_scale)
+
+    ds = _make_dataset(data["X_norm_tf"], data["Y_norm_tf"], data["Eeq_tf"], shuffle_buffer=1024)
+    iterator = iter(ds)
+    lam_var = tf.Variable(0.0, dtype=DTYPE, trainable=False)
+    step_counter = tf.Variable(0, dtype=tf.int64, trainable=False)
+    for _ in range(steps):
+        try:
+            xb, yb, eb = next(iterator)
+        except StopIteration:
+            iterator = iter(ds)
+            xb, yb, eb = next(iterator)
+        step_counter.assign_add(1)
+        lam_value = tf.cast(PHYS_TARGET_LAM, DTYPE) * tf.minimum(
+            tf.cast(1.0, DTYPE),
+            tf.cast(step_counter, DTYPE) / tf.cast(PHYS_WARMUP_STEPS, DTYPE),
+        )
+        lam_var.assign(lam_value)
+        _ = train_step_phys(xb, yb, eb, lam_var)
+
+    # Validation NLL 作为评分，数值越低越好
+    rv_train = model(data["X_norm_tf"], training=False)
+    nll_train = -tf.reduce_mean(rv_train.log_prob(data["Y_norm_tf"]))
+
+    val_nll = None
+    if val_data is not None:
+        rv_val = model(val_data["X_norm_tf"], training=False)
+        val_nll = float(-tf.reduce_mean(rv_val.log_prob(val_data["Y_norm_tf"])) .numpy())
+
+    return float(nll_train.numpy()), val_nll
+
+
+def hyperparameter_search(data: dict, col_idx: int, max_trials: int = 5) -> SVGPHyperParams:
+    train_idx, val_idx = _train_val_split(data["X_norm"].shape[0])
+    train_data = _materialize_subset(_slice_data_for_column(data, col_idx), train_idx)
+    val_data = _materialize_subset(_slice_data_for_column(data, col_idx), val_idx)
+
+    search_space = [
+        SVGPHyperParams(learning_rate=lr, noise0=n0, kl_scale=kl, amplitude=amp)
+        for lr in (5e-4, 1e-3)
+        for n0 in (0.02, 0.05)
+        for kl in (0.005, 0.01)
+        for amp in (0.4, 0.6)
+    ]
+
+    best_hp = SVGPHyperParams()
+    best_score = float("inf")
+
+    for trial, hp in enumerate(search_space[:max_trials], start=1):
+        train_nll, val_nll = _evaluate_config(hp, train_data, val_data)
+        total_score = 0.5 * train_nll + 0.5 * (val_nll if val_nll is not None else train_nll)
+        if total_score < best_score:
+            best_score = total_score
+            best_hp = hp
+        print(f"[HyperOpt] Trial {trial}: lr={hp.learning_rate}, noise0={hp.noise0}, kl={hp.kl_scale}, amp={hp.amplitude}, score={total_score:.4f}")
+
+    return best_hp
+
+
+def _make_dataset(x_tf, y_tf, e_tf, shuffle_buffer=4096):
+    ds = tf.data.Dataset.from_tensor_slices((x_tf, y_tf, e_tf))
+    if shuffle_buffer:
+        ds = ds.shuffle(shuffle_buffer, reshuffle_each_iteration=True)
+    return ds.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+
+
+def run_training(model: keras.Model, data: dict, save_name: str, hyperparams: SVGPHyperParams, target_col: int):
     """训练主循环：构建 Dataset、迭代 epochs，并打印可控日志。"""
-    train_step_phys = make_train_step(model, data["Y_std_tf"], data["Y_mean_tf"])
+    train_step_phys = make_train_step(model, data["Y_std_tf"], data["Y_mean_tf"], hyperparams.kl_scale)
     steps_per_epoch = math.ceil(data["X_norm_tf"].shape[0] / BATCH_SIZE)
     step_counter = tf.Variable(0, dtype=tf.int64, trainable=False)
     lam_var = tf.Variable(0.0, dtype=DTYPE, trainable=False)
 
-    for epoch in range(EPOCHS):
-        ds = (
-            tf.data.Dataset.from_tensor_slices((data["X_norm_tf"], data["Y_norm_tf"], data["Eeq_tf"]))
-            .shuffle(4096)
-            .batch(BATCH_SIZE)
-            .prefetch(tf.data.AUTOTUNE)
-        )
+    base_dataset = _make_dataset(data["X_norm_tf"], data["Y_norm_tf"], data["Eeq_tf"])
 
-        for step, (xb, yb, eb) in enumerate(ds, start=1):
+    for epoch in range(EPOCHS):
+        for step, (xb, yb, eb) in enumerate(base_dataset, start=1):
             step_counter.assign_add(1)
             lam_value = tf.cast(PHYS_TARGET_LAM, DTYPE) * tf.minimum(
                 tf.cast(1.0, DTYPE),
@@ -699,16 +814,41 @@ def run_training(model: keras.Model, data: dict, save_name: str):
     model.save_weights(save_name)
     print(f"\n[System] Model weights saved to: {save_name}")
 
+    stats_payload = {
+        "X_mean": data["X_mean"].tolist(),
+        "X_std": data["X_std"].tolist(),
+        "Y_mean": data["Y_mean"].tolist(),
+        "Y_std": data["Y_std"].tolist(),
+    }
+    with h5py.File(save_name, "a") as f:
+        f.attrs["hyperparams"] = json.dumps(_hp_to_dict(hyperparams))
+        f.attrs["target_column"] = int(target_col)
+        f.attrs["train_stats"] = json.dumps(stats_payload)
+
+
 
 def main():
+    parser = argparse.ArgumentParser(description="Train SVGP for a single target column")
+    parser.add_argument("--target-col", type=int, default=0, choices=[0, 1], help="目标列索引 (0 或 1)")
+    parser.add_argument("--output", type=str, default=None, help="权重文件名，默认 svgp_col{target}.h5")
+    parser.add_argument("--skip-hyperopt", action="store_true", help="跳过超参数搜索，直接用默认值")
+    args = parser.parse_args()
+
     data = load_data_and_prepare()
     total_steps = EPOCHS * math.ceil(data["X_norm"].shape[0] / BATCH_SIZE)
 
-    for col_idx, save_name in zip([0, 1], ["svgp_col0.h5", "svgp_col1.h5"]):
-        col_data = _slice_data_for_column(data, col_idx)
-        model = build_model(col_data["X_norm"], col_data["Y_norm"], total_steps)
-        _dry_run(model, col_data["X_norm_tf"], col_data["Y_norm_tf"])
-        run_training(model, col_data, save_name)
+    col_idx = int(args.target_col)
+    save_name = args.output or f"svgp_col{col_idx}.h5"
+    col_data = _slice_data_for_column(data, col_idx)
+
+    hyperparams = SVGPHyperParams()
+    if not args.skip_hyperopt:
+        hyperparams = hyperparameter_search(data, col_idx)
+        print(f"[HyperOpt] Selected hp: {_hp_to_dict(hyperparams)}")
+
+    model, hyperparams = build_model(col_data["X_norm"], col_data["Y_norm"], total_steps, hyperparams)
+    _dry_run(model, col_data["X_norm_tf"], col_data["Y_norm_tf"])
+    run_training(model, col_data, save_name, hyperparams, col_idx)
 
 
 if __name__ == "__main__":
