@@ -139,6 +139,7 @@ PHYS_WARMUP_STEPS = 2000  # 前多少 step 从 0 → λ（线性爬坡）
 PHYS_FORM = 'logratio'  # 'logratio' 或 'ratio'
 J_FLOOR_PERCENT = 1.0  # 对每个 batch 的 J_ref，下分位数百分位（1.0 表示第 1 百分位）
 J_ABS_FLOOR = 1e-30  # 绝对地板，避免 log(0)
+KII_PHYS_SCALE = 0.3  # 下调 K_II 的 J 正则权重，更多依赖对称性约束
 
 VERBOSE = 1  # 逐 batch 打印
 PRINT_EVERY = 1
@@ -401,11 +402,12 @@ class ARDRBFKernelLayer(keras.layers.Layer):
 def _format_log(epoch: int, step: int, steps_per_epoch: int, metrics: dict, prefix: str = "") -> str:
     """格式化单步训练日志，方便在训练循环中复用。"""
     prefix_fmt = f"{prefix} " if prefix else ""
+    sym_fmt = f" - sym:{metrics['loss_sym']:.3e}" if "loss_sym" in metrics else ""
     return (
         f"{prefix_fmt}Epoch {epoch + 1}/{EPOCHS} Step {step}/{steps_per_epoch} "
         f"- loss: {metrics['loss']:.6e} - nll: {metrics['nll']:.6e} - kl: {metrics['kl']:.6e} "
         f"- phys: {metrics['phys']:.6e} - lam:{metrics['lam']:.2e} "
-        f"- r_mean:{metrics['r_mean']:.2e} - J_floor:{metrics['J_floor']:.3e}"
+        f"- r_mean:{metrics['r_mean']:.2e} - J_floor:{metrics['J_floor']:.3e}{sym_fmt}"
     )
 
 
@@ -485,6 +487,8 @@ def load_data_and_prepare(mat_path: str = "matlab_input.mat"):
 
     _self_check(X_np_raw, keep_mask_np, X_norm_tf, X_mean, X_std)
 
+    theta_zero_mask = np.isclose(X_np_raw[keep_mask_np][:, 3], 0.0, atol=1e-5)
+
     return dict(
         X_norm=X_norm,
         Y_norm=Y_norm,
@@ -500,6 +504,7 @@ def load_data_and_prepare(mat_path: str = "matlab_input.mat"):
         X_std=X_std,
         Y_mean=Y_mean,
         Y_std=Y_std,
+        theta_zero_mask=theta_zero_mask,
         X_raw=X_np_raw[keep_mask_np],
         Y_raw=Y_np_raw[keep_mask_np],
     )
@@ -541,6 +546,7 @@ def build_model(
         Y_norm: np.ndarray,
         total_steps: int | None = None,
         hyperparams: SVGPHyperParams | None = None,
+        target_col: int = 0,
 ):
     """构建 SVGP 模型（显式返回分布对象，避免依赖 Keras 副作用）。"""
     if total_steps is None:
@@ -549,6 +555,15 @@ def build_model(
     total_steps = max(1, int(total_steps))
 
     hp = hyperparams or SVGPHyperParams()
+    if target_col == 0:
+        ls_prior = np.array([5.0, 1.0, 1.0, 0.3, 0.3, 10.0], np.float32)
+        noise0 = hp.noise0
+    else:
+        ls_prior = np.array([10.0, 10.0, 0.5, 0.2, 0.5, 20.0], np.float32)
+        noise0 = 1e-4
+
+    hp.length_scale_diag = ls_prior
+    hp.noise0 = noise0
     num_inducing = int(hp.num_inducing or min(1000, X_norm.shape[0]))
     D_out = int(Y_norm.shape[1])
 
@@ -567,7 +582,7 @@ def build_model(
         ),
         event_shape=(D_out,),
         inducing_index_points_initializer=ki.Constant(inducing_init_multi),
-        unconstrained_observation_noise_variance_initializer=ki.Constant(np.log(np.expm1(hp.noise0))),
+        unconstrained_observation_noise_variance_initializer=ki.Constant(np.log(np.expm1(noise0))),
         variational_inducing_observations_scale_initializer=ki.Constant(initial_scale),
         jitter=JITTER,
         convert_to_tensor_fn=_identity_with_shape,  # 返回分布对象并附加 shape 元数据
@@ -595,6 +610,13 @@ def build_model(
         global_clipnorm=1.0,
     )
     model.compile(optimizer=optimizer, loss=negloglik)
+
+    if target_col == 1:
+        for var in model.trainable_variables:
+            if "observation_noise_variance" in var.name:
+                var.assign(tf.cast(np.log(np.expm1(noise0)), DTYPE))
+                var._trainable = False
+
     return model, hp
 
 
@@ -608,13 +630,21 @@ def _dry_run(model: keras.Model, X_norm_tf: tf.Tensor, Y_norm_tf: tf.Tensor):
 
 
 def make_train_step(
-        model: keras.Model, Y_std_tf: tf.Tensor, Y_mean_tf: tf.Tensor, kl_scale: float
+        model: keras.Model,
+        y_std_tf: tf.Tensor,
+        y_mean_tf: tf.Tensor,
+        kl_scale: float,
+        target_col: int,
+        y_other_std_tf: tf.Tensor,
+        y_other_mean_tf: tf.Tensor,
+        lambda_sym: float = 0.0,
 ):
     """返回带物理正则的单步训练函数，封装 warmup/地板/ratio 选择。"""
     kl_scale_tf = tf.cast(kl_scale, DTYPE)
+    lambda_sym_tf = tf.cast(lambda_sym, DTYPE)
 
     @tf.function
-    def train_step_phys(x_batch, y_batch, eeq_phys_batch, lam_var):
+    def train_step_phys(x_batch, y_batch, y_other_true, eeq_phys_batch, mask_zero, lam_var):
         lam = tf.cast(lam_var, DTYPE)
 
         with tf.GradientTape() as tape:
@@ -625,8 +655,16 @@ def make_train_step(
 
             # 反标准化到物理量（确保正则作用在真实尺度上）
             y_pred_mean = rv.mean()
-            K_pred = y_pred_mean * Y_std_tf + Y_mean_tf
-            K_true = y_batch * Y_std_tf + Y_mean_tf
+            K_target_pred = y_pred_mean * y_std_tf + y_mean_tf
+            K_target_true = y_batch * y_std_tf + y_mean_tf
+            K_other_true = y_other_true * y_other_std_tf + y_other_mean_tf
+
+            if target_col == 0:
+                K_pred = tf.concat([K_target_pred, K_other_true], axis=-1)
+                K_true = tf.concat([K_target_true, K_other_true], axis=-1)
+            else:
+                K_pred = tf.concat([K_other_true, K_target_pred], axis=-1)
+                K_true = tf.concat([K_other_true, K_target_true], axis=-1)
 
             # E'：平面应变（或应力）。若要切换到平面应力，可直接使用 eeq_phys_batch。
             Eprime = eeq_phys_batch / (1.0 - NU ** 2)
@@ -652,8 +690,19 @@ def make_train_step(
                 r = J_hat_c / J_ref_c - 1.0
             phys = tf.reduce_mean(tf.square(r)) * lam
 
+            loss_sym = tf.cast(0.0, DTYPE)
+            if target_col == 1:
+                mask_zero_bool = tf.reshape(tf.cast(mask_zero, tf.bool), [-1])
+                k_target_flat = tf.reshape(K_target_pred, [-1])
+                zeros_to_penalize = tf.boolean_mask(k_target_flat, mask_zero_bool)
+                loss_sym = tf.cond(
+                    tf.size(zeros_to_penalize) > 0,
+                    lambda: tf.reduce_mean(tf.square(zeros_to_penalize)) * lambda_sym_tf,
+                    lambda: tf.cast(0.0, DTYPE),
+                )
+
             # 汇总损失
-            loss = nll + kl + phys
+            loss = nll + kl + phys + loss_sym
 
         # 反向传播 + 参数更新
         grads = tape.gradient(loss, model.trainable_variables)
@@ -661,7 +710,7 @@ def make_train_step(
 
         return {
             "loss": loss, "nll": nll, "kl": kl, "phys": phys, "lam": lam,
-            "r_mean": tf.reduce_mean(r), "J_floor": j_floor,
+            "r_mean": tf.reduce_mean(r), "J_floor": j_floor, "loss_sym": loss_sym,
         }
 
     return train_step_phys
@@ -670,9 +719,15 @@ def make_train_step(
 def _slice_data_for_column(data: dict, col_idx: int) -> dict:
     """Prepare a per-column view of the dataset for single-output training."""
 
-    y_norm_slice = data["Y_norm"][:, col_idx : col_idx + 1]
+    y_norm_full = data["Y_norm"]
+    y_norm_slice = y_norm_full[:, col_idx : col_idx + 1]
     y_mean_slice = data["Y_mean"][col_idx : col_idx + 1]
     y_std_slice = data["Y_std"][col_idx : col_idx + 1]
+
+    other_idx = [i for i in range(y_norm_full.shape[1]) if i != col_idx]
+    y_other_norm = y_norm_full[:, other_idx]
+    y_other_mean = data["Y_mean"][other_idx]
+    y_other_std = data["Y_std"][other_idx]
 
     return {
         **data,
@@ -680,6 +735,11 @@ def _slice_data_for_column(data: dict, col_idx: int) -> dict:
         "Y_norm_tf": tf.convert_to_tensor(y_norm_slice, dtype=DTYPE),
         "Y_mean_tf": tf.convert_to_tensor(y_mean_slice, dtype=DTYPE),
         "Y_std_tf": tf.convert_to_tensor(y_std_slice, dtype=DTYPE),
+        "Y_other_norm": y_other_norm,
+        "Y_other_norm_tf": tf.convert_to_tensor(y_other_norm, dtype=DTYPE),
+        "Y_other_mean_tf": tf.convert_to_tensor(y_other_mean, dtype=DTYPE),
+        "Y_other_std_tf": tf.convert_to_tensor(y_other_std, dtype=DTYPE),
+        "theta_zero_mask_tf": tf.convert_to_tensor(data.get("theta_zero_mask", np.zeros(y_norm_slice.shape[0], dtype=bool)), dtype=tf.bool),
     }
 
 
@@ -691,15 +751,27 @@ def _train_val_split(N: int, val_ratio: float = 0.15):
 
 
 def _materialize_subset(data: dict, train_idx: np.ndarray) -> dict:
-    return {
+    base_mask = data.get("theta_zero_mask", np.zeros(data["X_norm"].shape[0], dtype=bool))
+    sliced = {
         **data,
         "X_norm": data["X_norm"][train_idx],
         "Y_norm": data["Y_norm"][train_idx],
         "Eeq": data["Eeq"][train_idx],
-        "X_norm_tf": tf.convert_to_tensor(data["X_norm"][train_idx], dtype=DTYPE),
-        "Y_norm_tf": tf.convert_to_tensor(data["Y_norm"][train_idx], dtype=DTYPE),
-        "Eeq_tf": tf.convert_to_tensor(data["Eeq"][train_idx], dtype=DTYPE),
+        "theta_zero_mask": base_mask[train_idx],
     }
+
+    if "Y_other_norm" in data:
+        sliced["Y_other_norm"] = data["Y_other_norm"][train_idx]
+
+    sliced["X_norm_tf"] = tf.convert_to_tensor(sliced["X_norm"], dtype=DTYPE)
+    sliced["Y_norm_tf"] = tf.convert_to_tensor(sliced["Y_norm"], dtype=DTYPE)
+    sliced["Eeq_tf"] = tf.convert_to_tensor(sliced["Eeq"], dtype=DTYPE)
+    sliced["theta_zero_mask_tf"] = tf.convert_to_tensor(sliced["theta_zero_mask"], dtype=tf.bool)
+
+    if "Y_other_norm" in sliced:
+        sliced["Y_other_norm_tf"] = tf.convert_to_tensor(sliced["Y_other_norm"], dtype=DTYPE)
+
+    return sliced
 
 
 def _compute_batched_nll(model: keras.Model, x_tf: tf.Tensor, y_tf: tf.Tensor, batch_size: int = BATCH_SIZE) -> float:
@@ -719,10 +791,29 @@ def _compute_batched_nll(model: keras.Model, x_tf: tf.Tensor, y_tf: tf.Tensor, b
 
 
 def _evaluate_config(hp: SVGPHyperParams, data: dict, val_data: dict | None = None, steps: int = 1000) -> tuple[float, float | None]:
-    model, hp_used = build_model(data["X_norm"], data["Y_norm"], total_steps=steps, hyperparams=hp)
-    train_step_phys = make_train_step(model, data["Y_std_tf"], data["Y_mean_tf"], hp_used.kl_scale)
+    model, hp_used = build_model(data["X_norm"], data["Y_norm"], total_steps=steps, hyperparams=hp, target_col=col_idx)
+    train_step_phys = make_train_step(
+        model,
+        data["Y_std_tf"],
+        data["Y_mean_tf"],
+        hp_used.kl_scale,
+        col_idx,
+        data["Y_other_std_tf"],
+        data["Y_other_mean_tf"],
+        lambda_sym=1000.0 if col_idx == 1 else 0.0,
+    )
 
-    ds = _make_dataset(data["X_norm_tf"], data["Y_norm_tf"], data["Eeq_tf"], shuffle_buffer=1024)
+    ds = _make_dataset(
+        data["X_norm_tf"],
+        data["Y_norm_tf"],
+        data["Y_other_norm_tf"],
+        data["Eeq_tf"],
+        data.get(
+            "theta_zero_mask_tf",
+            tf.zeros(tf.shape(data["Y_norm_tf"])[0], dtype=tf.bool),
+        ),
+        shuffle_buffer=1024,
+    )
     iterator = iter(ds)
     lam_var = tf.Variable(0.0, dtype=DTYPE, trainable=False)
     step_counter = tf.Variable(0, dtype=tf.int64, trainable=False)
@@ -734,19 +825,20 @@ def _evaluate_config(hp: SVGPHyperParams, data: dict, val_data: dict | None = No
 
     for _ in range(steps):
         try:
-            xb, yb, eb = next(iterator)
+            xb, yb, y_other_b, eb, mask_b = next(iterator)
         except StopIteration:
             iterator = iter(ds)
-            xb, yb, eb = next(iterator)
+            xb, yb, y_other_b, eb, mask_b = next(iterator)
 
         step_counter.assign_add(1)
 
-        lam_value = tf.cast(hp_used.phys_lam, DTYPE) * tf.minimum(
+        lam_scale = tf.cast(KII_PHYS_SCALE if col_idx == 1 else 1.0, DTYPE)
+        lam_value = tf.cast(hp_used.phys_lam, DTYPE) * lam_scale * tf.minimum(
             tf.cast(1.0, DTYPE),
             tf.cast(step_counter, DTYPE) / tf.cast(eval_warmup_steps, DTYPE),
         )
         lam_var.assign(lam_value)
-        out = train_step_phys(xb, yb, eb, lam_var)
+        out = train_step_phys(xb, yb, y_other_b, eb, mask_b, lam_var)
 
         if VERBOSE and (int(step_counter.numpy()) % PRINT_EVERY == 0):
             metrics = {
@@ -831,8 +923,10 @@ def hyperparameter_search(data: dict, col_idx: int, max_trials: int = 8) -> SVGP
     return best_hp
 
 
-def _make_dataset(x_tf, y_tf, e_tf, shuffle_buffer=4096):
-    ds = tf.data.Dataset.from_tensor_slices((x_tf, y_tf, e_tf))
+def _make_dataset(x_tf, y_tf, y_other_tf, e_tf, mask_zero_tf, shuffle_buffer=4096):
+    ds = tf.data.Dataset.from_tensor_slices(
+        (x_tf, y_tf, y_other_tf, e_tf, tf.cast(mask_zero_tf, tf.bool))
+    )
     if shuffle_buffer:
         ds = ds.shuffle(shuffle_buffer, reshuffle_each_iteration=True)
     return ds.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
@@ -840,22 +934,41 @@ def _make_dataset(x_tf, y_tf, e_tf, shuffle_buffer=4096):
 
 def run_training(model: keras.Model, data: dict, save_name: str, hyperparams: SVGPHyperParams, target_col: int):
     """训练主循环：构建 Dataset、迭代 epochs，并打印可控日志。"""
-    train_step_phys = make_train_step(model, data["Y_std_tf"], data["Y_mean_tf"], hyperparams.kl_scale)
+    train_step_phys = make_train_step(
+        model,
+        data["Y_std_tf"],
+        data["Y_mean_tf"],
+        hyperparams.kl_scale,
+        target_col,
+        data["Y_other_std_tf"],
+        data["Y_other_mean_tf"],
+        lambda_sym=1000.0 if target_col == 1 else 0.0,
+    )
     steps_per_epoch = math.ceil(data["X_norm_tf"].shape[0] / BATCH_SIZE)
     step_counter = tf.Variable(0, dtype=tf.int64, trainable=False)
     lam_var = tf.Variable(0.0, dtype=DTYPE, trainable=False)
 
-    base_dataset = _make_dataset(data["X_norm_tf"], data["Y_norm_tf"], data["Eeq_tf"])
+    base_dataset = _make_dataset(
+        data["X_norm_tf"],
+        data["Y_norm_tf"],
+        data["Y_other_norm_tf"],
+        data["Eeq_tf"],
+        data.get(
+            "theta_zero_mask_tf",
+            tf.zeros(tf.shape(data["Y_norm_tf"])[0], dtype=tf.bool),
+        ),
+    )
 
     for epoch in range(EPOCHS):
-        for step, (xb, yb, eb) in enumerate(base_dataset, start=1):
+        for step, (xb, yb, y_other_b, eb, mask_b) in enumerate(base_dataset, start=1):
             step_counter.assign_add(1)
-            lam_value = tf.cast(hyperparams.phys_lam, DTYPE) * tf.minimum(
+            lam_scale = tf.cast(KII_PHYS_SCALE if target_col == 1 else 1.0, DTYPE)
+            lam_value = tf.cast(hyperparams.phys_lam, DTYPE) * lam_scale * tf.minimum(
                 tf.cast(1.0, DTYPE),
                 tf.cast(step_counter, DTYPE) / tf.cast(PHYS_WARMUP_STEPS, DTYPE),
             )
             lam_var.assign(lam_value)
-            out = train_step_phys(xb, yb, eb, lam_var)
+            out = train_step_phys(xb, yb, y_other_b, eb, mask_b, lam_var)
             metrics = {
                 "loss": float(out['loss'].numpy()),
                 "nll": float(out['nll'].numpy()),
@@ -864,12 +977,16 @@ def run_training(model: keras.Model, data: dict, save_name: str, hyperparams: SV
                 "lam": float(out['lam'].numpy()),
                 "r_mean": float(out['r_mean'].numpy()),
                 "J_floor": float(out['J_floor'].numpy()),
+                "loss_sym": float(out['loss_sym'].numpy()),
             }
 
             if VERBOSE and (step % PRINT_EVERY == 0 or step == 1 or step == steps_per_epoch):
                 print(_format_log(epoch, step, steps_per_epoch, metrics))
 
-            if not np.isfinite(metrics["loss"]) or not np.isfinite(metrics["nll"]) or not np.isfinite(metrics["phys"]):
+            if (
+                not np.isfinite(metrics["loss"]) or not np.isfinite(metrics["nll"]) or
+                not np.isfinite(metrics["phys"]) or not np.isfinite(metrics["loss_sym"])
+            ):
                 print(f"\n[NaN DETECTED] at epoch {epoch + 1}, step {step}")
                 # 打印该 batch 的安全统计，便于定位
                 Kp = (model(xb, training=False).mean() * data["Y_std_tf"] + data["Y_mean_tf"]).numpy()
@@ -917,7 +1034,7 @@ def main():
         hyperparams = hyperparameter_search(data, col_idx)
         print(f"[HyperOpt] Selected hp: {_hp_to_dict(hyperparams)}")
 
-    model, hyperparams = build_model(col_data["X_norm"], col_data["Y_norm"], total_steps, hyperparams)
+    model, hyperparams = build_model(col_data["X_norm"], col_data["Y_norm"], total_steps, hyperparams, target_col=col_idx)
     _dry_run(model, col_data["X_norm_tf"], col_data["Y_norm_tf"])
     run_training(model, col_data, save_name, hyperparams, col_idx)
 
