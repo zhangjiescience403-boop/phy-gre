@@ -47,22 +47,34 @@ def test_single_step_shapes():
     Eeq_np, _ = svgp_fix_module.preprocess_window_eq(X_raw[keep_mask], m=4, delta_ratio=0.1)
 
     X_norm_tf = tf.convert_to_tensor(X_norm, dtype=svgp_fix_module.DTYPE)
-    Y_norm_tf = tf.convert_to_tensor(Y_norm, dtype=svgp_fix_module.DTYPE)
+    Y_norm_tf = tf.convert_to_tensor(Y_norm[:, :1], dtype=svgp_fix_module.DTYPE)
+    Y_other_norm_tf = tf.convert_to_tensor(Y_norm[:, 1:], dtype=svgp_fix_module.DTYPE)
     Eeq_tf = tf.convert_to_tensor(Eeq_np, dtype=svgp_fix_module.DTYPE)
-    Y_mean_tf = tf.convert_to_tensor(Y_mean, dtype=svgp_fix_module.DTYPE)
-    Y_std_tf = tf.convert_to_tensor(Y_std, dtype=svgp_fix_module.DTYPE)
+    Y_mean_tf = tf.convert_to_tensor(Y_mean[:1], dtype=svgp_fix_module.DTYPE)
+    Y_std_tf = tf.convert_to_tensor(Y_std[:1], dtype=svgp_fix_module.DTYPE)
+    Y_other_mean_tf = tf.convert_to_tensor(Y_mean[1:], dtype=svgp_fix_module.DTYPE)
+    Y_other_std_tf = tf.convert_to_tensor(Y_std[1:], dtype=svgp_fix_module.DTYPE)
+    mask_zero_tf = tf.zeros(Y_norm_tf.shape[0], dtype=tf.bool)
 
     # 构建模型并做一次前向
-    model = svgp_fix_module.build_model(X_norm, Y_norm)
+    model = svgp_fix_module.build_model(X_norm, Y_norm[:, :1], target_col=0)
     rv = model(X_norm_tf, training=False)
     assert rv.mean().shape == Y_norm_tf.shape
 
     # 单步训练，检查返回标量是否有限
-    train_step = svgp_fix_module.make_train_step(model, Y_std_tf, Y_mean_tf)
-    step_counter = tf.Variable(1, dtype=tf.int64)
-    out = train_step(X_norm_tf, Y_norm_tf, Eeq_tf, step_counter)
+    train_step = svgp_fix_module.make_train_step(
+        model,
+        Y_std_tf,
+        Y_mean_tf,
+        svgp_fix_module.KL_SCALE,
+        0,
+        Y_other_std_tf,
+        Y_other_mean_tf,
+    )
+    lam_var = tf.Variable(1.0, dtype=svgp_fix_module.DTYPE)
+    out = train_step(X_norm_tf, Y_norm_tf, Y_other_norm_tf, Eeq_tf, mask_zero_tf, lam_var)
 
-    for key in ["loss", "nll", "kl", "phys", "lam", "r_mean", "J_floor"]:
+    for key in ["loss", "nll", "kl", "phys", "lam", "r_mean", "J_floor", "loss_sym"]:
         tensor = out[key]
         assert tensor.shape == ()
         assert tf.reduce_all(tf.math.is_finite(tensor))
